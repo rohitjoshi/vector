@@ -50,6 +50,7 @@ scopes:
   - journald source
   - kafka source
   - splunk_hec source
+  - prometheus source
   - statsd source
   - stdin source
   - syslog source
