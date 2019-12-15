@@ -219,6 +219,7 @@ jobs:
           - xpack.ssl.key=certs/localhost.key
       - image: yandex/clickhouse-server:19
       - image: timberiodev/mock-ec2-metadata:latest
+      - image: graphiteapp/graphite-statsd
     steps:
       - checkout
       - setup_remote_docker:

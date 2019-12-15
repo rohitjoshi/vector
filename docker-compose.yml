@@ -78,3 +78,10 @@ services:
       image: timberiodev/mock-ec2-metadata:latest 
       ports: 
         - "8111:8111"
+    graphite-statsd:
+      image: graphiteapp/graphite-statsd
+      ports:
+        - "8127:80"
+        - "2003:2003"
+        - "8125:8125/udp"
+        - "8126:8126"
