@@ -1,8 +1,9 @@
 ---
+last_modified_on: "2020-03-31"
 id: introducing-vector
 title: Introducing Vector
 description: "Hello World. Bringing Vector to life."
-author_id: luke
+author_github: https://github.com/lukesteensen
 tags: ["type: announcement"]
 ---
 

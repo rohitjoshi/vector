@@ -1,6 +1,6 @@
 ---
 title: Unit Tests
-description: Unit test configuration options
+description: Vector's unit test configuration options, allowing you to unit test your Vector configuration files.
 status: beta
 ---
 
@@ -28,35 +28,33 @@ vector test /etc/vector/*.toml
 
 <TabItem value="common">
 
-<CodeHeader fileName="vector.toml" />
-
-```toml
-[transforms.bar]
+```toml title="vector.toml"
+[transforms.foo]
   type = "regex_parser"
   regex = "^(?P<timestamp>[\\w\\-:\\+]+) (?P<level>\\w+) (?P<message>.*)$"
 
-<%= config_example(metadata.testing.tests.options_list, path: "tests", array: true, common: true) %>
+<%=
+  config_example(metadata.tests.children_list, table_path: ["tests"], array: true) do |option|
+    option.common?
+  end
+%>
 ```
 
 </TabItem>
 <TabItem value="advanced">
 
-<CodeHeader fileName="vector.toml" />
-
-```toml
-[transforms.bar]
+```toml title="vector.toml"
+[transforms.foo]
   type = "regex_parser"
   regex = "^(?P<timestamp>[\\w\\-:\\+]+) (?P<level>\\w+) (?P<message>.*)$"
 
-<%= config_example(metadata.testing.tests.options_list, path: "tests", array: true, common: false) %>
+<%= config_example(metadata.tests.children_list, table_path: ["tests"], array: true) %>
 ```
 
 </TabItem>
 
 </Tabs>
 
-For more information about unit tests check out [this guide][docs.setup.guides.unit-testing].
+For more information about unit tests check out [this guide][guides.advanced.unit-testing].
 
-## Options
-
-<%= options(metadata.testing.tests.options_list, heading_depth: 3) %>
+<%= fields(metadata.tests.children_list, heading_depth: 3) %>

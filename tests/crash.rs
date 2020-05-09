@@ -1,6 +1,9 @@
-use futures::{future, sync::mpsc, Async, AsyncSink, Sink, Stream};
+#![cfg(all(feature = "sources-socket", feature = "sinks-socket"))]
+
+use futures01::{future, sync::mpsc, Async, AsyncSink, Sink, Stream};
 use serde::{Deserialize, Serialize};
 use vector::{
+    shutdown::ShutdownSignal,
     test_util::{
         block_on, next_addr, random_lines, receive, runtime, send_lines, shutdown_on_idle,
         wait_for_tcp,
@@ -57,11 +60,14 @@ fn test_sink_panic() {
     let out_addr = next_addr();
 
     let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr.into()));
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_tcp_config(in_addr),
+    );
     config.add_sink(
         "out",
         &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
     config.add_sink("panic", &["in"], PanicSink);
 
@@ -136,11 +142,14 @@ fn test_sink_error() {
     let out_addr = next_addr();
 
     let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr.into()));
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_tcp_config(in_addr),
+    );
     config.add_sink(
         "out",
         &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
     config.add_sink("error", &["in"], ErrorSink);
 
@@ -178,6 +187,7 @@ impl config::SourceConfig for ErrorSourceConfig {
         &self,
         _name: &str,
         _globals: &GlobalOptions,
+        _shutdown: ShutdownSignal,
         _out: mpsc::Sender<Event>,
     ) -> Result<sources::Source, vector::Error> {
         Ok(Box::new(future::err(())))
@@ -200,12 +210,15 @@ fn test_source_error() {
     let out_addr = next_addr();
 
     let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr.into()));
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_tcp_config(in_addr),
+    );
     config.add_source("error", ErrorSourceConfig);
     config.add_sink(
         "out",
         &["in", "error"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
 
     let mut rt = runtime();
@@ -242,6 +255,7 @@ impl config::SourceConfig for PanicSourceConfig {
         &self,
         _name: &str,
         _globals: &GlobalOptions,
+        _shutdown: ShutdownSignal,
         _out: mpsc::Sender<Event>,
     ) -> Result<sources::Source, vector::Error> {
         Ok(Box::new(future::lazy::<_, future::FutureResult<(), ()>>(
@@ -266,12 +280,15 @@ fn test_source_panic() {
     let out_addr = next_addr();
 
     let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr.into()));
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_tcp_config(in_addr),
+    );
     config.add_source("panic", PanicSourceConfig);
     config.add_sink(
         "out",
         &["in", "panic"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
 
     let mut rt = runtime();

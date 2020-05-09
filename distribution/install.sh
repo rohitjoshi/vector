@@ -11,14 +11,14 @@
 set -u
 
 # If PACKAGE_ROOT is unset or empty, default it.
-PACKAGE_ROOT="${PACKAGE_ROOT:-https://packages.timber.io/vector}"
+PACKAGE_ROOT="${PACKAGE_ROOT:-"https://packages.timber.io/vector"}"
 _divider="--------------------------------------------------------------------------------"
 _prompt=">>>"
 _indent="   "
 
 header() {
     cat 1>&2 <<EOF
-                                   __   __  __  
+                                   __   __  __
                                    \ \ / / / /
                                     \ V / / /
                                      \_/  \/
@@ -46,6 +46,7 @@ USAGE:
 
 FLAGS:
     -y                      Disable confirmation prompt.
+        --no-modify-path    Don't configure the PATH environment variable
     -h, --help              Prints help information
 EOF
 }
@@ -54,14 +55,16 @@ main() {
     downloader --check
     header
 
-    local _package_manager=$(get_package_manager)
-
     local prompt=yes
+    local modify_path=yes
     for arg in "$@"; do
         case "$arg" in
             -h|--help)
                 usage
                 exit 0
+                ;;
+            --no-modify-path)
+                modify_path=no
                 ;;
             -y)
                 prompt=no
@@ -74,17 +77,12 @@ main() {
     # Confirm with the user before proceeding to install Vector through a
     # package manager. Otherwise, we install from an archive.
     if [ "$prompt" = "yes" ]; then
-        if [ -n "$_package_manager" ]; then
-            echo "$_prompt We'll be installing Vector via the $_package_manager package at https://packages.timber.io/vector/latest/"
-        else
-            echo "$_prompt We'll be installing Vector via a pre-built archive at https://packages.timber.io/vector/latest/"
-        fi
-
+        echo "$_prompt We'll be installing Vector via a pre-built archive at https://packages.timber.io/vector/latest/"
         echo "$_prompt Ready to proceed? (y/n)"
         echo ""
 
         while true; do
-            read -p "$_prompt " _choice </dev/tty
+            read -rp "$_prompt " _choice </dev/tty
             case $_choice in
                 n)
                     err "exiting"
@@ -100,38 +98,12 @@ main() {
 
         # Print a divider to separate the Vector installer output and the
         # package manager installer output.
-        if [ -n "$_package_manager" ]; then
-            echo ""
-            echo "$_divider"
-            echo ""
-        fi
+        echo ""
+        echo "$_divider"
+        echo ""
     fi
 
-    case "$_package_manager" in
-        dpkg)
-            install_from_deb
-            ;;
-        rpm)
-            install_from_rpm
-            ;;
-        homebrew)
-            brew tap timberio/brew
-            brew install vector
-            ;;
-        *)
-            install_from_archive
-            ;;
-    esac
-}
-
-get_package_manager() {
-    if check_cmd "dpkg"; then
-        echo "dpkg"
-    elif check_cmd "rpm"; then
-        echo "rpm"
-    elif check_cmd "brew"; then
-        echo "homebrew"
-    fi
+    install_from_archive $modify_path
 }
 
 install_from_archive() {
@@ -146,6 +118,7 @@ install_from_archive() {
     need_cmd sed
 
     get_architecture || return 1
+    local modify_path="$1"
     local _arch="$RETVAL"
     assert_nz "$_arch" "arch"
 
@@ -156,6 +129,12 @@ install_from_archive() {
             ;;
         x86_64-*linux*)
             _archive_arch="x86_64-unknown-linux-musl"
+            ;;
+        armv7-*linux*hf)
+            _archive_arch="armv7-unknown-linux-musleabihf"
+            ;;
+        aarch64-*linux*)
+            _archive_arch="aarch64-unknown-linux-musl"
             ;;
         *)
             err "unsupported arch: $_arch"
@@ -171,29 +150,29 @@ install_from_archive() {
 
     ensure mkdir -p "$_dir"
 
-    printf "$_prompt Downloading Vector via $_url"
+    printf "%s Downloading Vector via %s" "$_prompt" "$_url"
     ensure downloader "$_url" "$_file"
     printf " ✓\n"
 
-    printf "$_prompt Unpacking archive to $HOME/.vector ..."
+    printf "%s Unpacking archive to $HOME/.vector ..." "$_prompt"
     ensure mkdir -p "$HOME/.vector"
-    local _dir_name=$(tar -tzf ${_file} | head -1 | sed -e 's/\.\/\(.*\)\//\1/')
-    ensure tar -xzf "$_file" --directory="$HOME/.vector" --strip-components=1
+    ensure tar -xzf "$_file" --directory="$HOME/.vector" --strip-components=2
 
     printf " ✓\n"
 
-    printf "$_prompt Adding Vector path to ~/.profile"
-    local _path="export PATH=\"\$HOME/.vector/${_dir_name}/bin:\$PATH\""
-    grep -qxF "${_path}" "${HOME}/.profile" || echo "${_path}" >> "${HOME}/.profile"
-    grep -qxF "${_path}" "${HOME}/.zprofile" || echo "${_path}" >> "${HOME}/.zprofile"
-    printf " ✓\n"
+    if [ "$modify_path" = "yes" ]; then
+      local _path="export PATH=\"\$HOME/.vector/bin:\$PATH\""
+      add_to_path "${HOME}/.zprofile" "${_path}"
+      add_to_path "${HOME}/.profile" "${_path}"
+      printf " ✓\n"
+    fi
 
-    printf "$_prompt Install succeeded! 🚀\n"
-    printf "$_prompt To start Vector:\n"
+    printf "%s Install succeeded! 🚀\n" "$_prompt"
+    printf "%s To start Vector:\n" "$_prompt"
     printf "\n"
-    printf "$_indent vector --config ~/.vector/vector.toml\n"
+    printf "%s vector --config ~/.vector/vector.toml\n" "$_indent"
     printf "\n"
-    printf "$_prompt More information at https://vector.dev/docs/\n"
+    printf "%s More information at https://vector.dev/docs/\n" "$_prompt"
 
     local _retval=$?
 
@@ -203,84 +182,17 @@ install_from_archive() {
     return "$_retval"
 }
 
-install_from_deb() {
-    need_cmd dpkg
-    need_cmd mktemp
-    need_cmd mkdir
+add_to_path() {
+  local file="$1"
+  local new_path="$2"
 
-    get_architecture || return 1
-    local _arch="$RETVAL"
-    assert_nz "$_arch" "arch"
+  printf "%s Adding Vector path to ${file}" "$_prompt"
 
-    local _package_arch=""
-    case "$_arch" in
-        x86_64-*)
-            _package_arch="amd64"
-            ;;
-        *)
-            err "unsupported arch: $_arch"
-            ;;
-    esac
-
-    local _url="${PACKAGE_ROOT}/latest/vector-${_package_arch}.deb"
-    local _dir="$(mktemp -d 2>/dev/null || ensure mktemp -d -t vector-install)"
-    local _file="${_dir}/vector-${_package_arch}.deb"
-
-    ensure mkdir -p "$_dir"
-
-    printf "$_prompt Downloading Vector via $_url"
-    ensure downloader "$_url" "$_file"
-    printf " ✓\n"
-
-    printf "$_prompt Installing Vector via dpkg..."
-    ensure_with_sudo dpkg -i $_file
-
-    printf "$_prompt Install succeeded! 🚀\n"
-    printf "$_prompt To start Vector:\n"
-    printf "\n"
-    printf "$_indent sudo systemctl start vector\n"
-    printf "\n"
-    printf "$_prompt More information at https://vector.dev/docs/\n"
-}
-
-install_from_rpm() {
-    need_cmd mktemp
-    need_cmd mkdir
-    need_cmd rpm
-
-    get_architecture || return 1
-    local _arch="$RETVAL"
-    assert_nz "$_arch" "arch"
-
-    local _package_arch=""
-    case "$_arch" in
-        x86_64-*)
-            _package_arch="x86_64"
-            ;;
-        *)
-            err "unsupported arch: $_arch"
-            ;;
-    esac
-
-    local _url="${PACKAGE_ROOT}/latest/vector-${_package_arch}.rpm"
-    local _dir="$(mktemp -d 2>/dev/null || ensure mktemp -d -t vector-install)"
-    local _file="${_dir}/vector-${_package_arch}.rpm"
-
-    ensure mkdir -p "$_dir"
-
-    printf "$_prompt Downloading Vector via $_url"
-    ensure downloader "$_url" "$_file"
-    printf " ✓\n"
-
-    printf "$_prompt Installing Vector via rpm..."
-    ensure_with_sudo rpm -i $_file
-
-    printf "$_prompt Install succeeded! 🚀\n"
-    printf "$_prompt To start Vector:\n"
-    printf "\n"
-    printf "$_indent sudo systemctl start vector\n"
-    printf "\n"
-    printf "$_prompt More information at https://vector.dev/docs/\n"
+  if [ ! -f "$file" ]; then
+    echo "${new_path}" >> "${file}"
+  else
+    grep -qxF "${new_path}" "${file}" || echo "${new_path}" >> "${file}"
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -466,6 +378,14 @@ get_architecture() {
             powerpc64)
                 _cputype=powerpc
                 ;;
+            aarch64)
+                _cputype=armv7
+                if [ "$_ostype" = "linux-android" ]; then
+                    _ostype=linux-androideabi
+                else
+                    _ostype="${_ostype}eabihf"
+                fi
+                ;;
         esac
     fi
 
@@ -491,7 +411,6 @@ err() {
 
 need_cmd() {
     if ! check_cmd "$1"; then
-
         err "need '$1' (command not found)"
     fi
 }
@@ -508,7 +427,8 @@ assert_nz() {
 # will immediately terminate with an error showing the failing
 # command.
 ensure() {
-    local output="$($@ 2>&1 > /dev/null)"
+    local output
+    output="$("$@" 2>&1 > /dev/null)"
 
     if [ "$output" ]; then
         echo ""
@@ -519,14 +439,6 @@ ensure() {
         echo "$output" >&2
         exit 1
     fi
-}
-
-ensure_with_sudo() {
-    if ! [ -x "$(command -v sudo)" ]; then
-        ensure $@
-    else
-        ensure sudo $@
-    fi 
 }
 
 # This is just for indicating that commands' results are being

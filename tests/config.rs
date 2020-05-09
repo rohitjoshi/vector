@@ -1,18 +1,24 @@
-use vector::topology::{self, Config};
+use vector::topology::{self, Config, ConfigDiff};
 
 fn load(config: &str) -> Result<Vec<String>, Vec<String>> {
     let rt = vector::runtime::Runtime::single_threaded().unwrap();
     Config::load(config.as_bytes())
-        .and_then(|c| topology::builder::build_pieces(&c, rt.executor()))
+        .and_then(|c| topology::builder::build_pieces(&c, &ConfigDiff::initial(&c), rt.executor()))
         .map(|(_topology, warnings)| warnings)
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-sampler",
+    feature = "sinks-socket"
+))]
 #[test]
 fn happy_path() {
     load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.sampler]
@@ -22,7 +28,8 @@ fn happy_path() {
         pass_list = ["error"]
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["sampler"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -33,13 +40,13 @@ fn happy_path() {
     load(
         r#"
         [sources]
-        in = {type = "tcp", address = "127.0.0.1:1235"}
+        in = {type = "socket", mode = "tcp", address = "127.0.0.1:1235"}
 
         [transforms]
         sampler = {type = "sampler", inputs = ["in"], rate = 10, pass_list = ["error"]}
 
         [sinks]
-        out = {type = "tcp", inputs = ["sampler"], encoding = "text", address = "127.0.0.1:9999"}
+        out = {type = "socket", mode = "tcp", inputs = ["sampler"], encoding = "text", address = "127.0.0.1:9999"}
       "#,
     )
     .unwrap();
@@ -62,15 +69,38 @@ fn bad_syntax() {
     );
 }
 
+#[cfg(all(feature = "sources-socket", feature = "sinks-socket"))]
 #[test]
 fn missing_key() {
     let err = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        inputs = ["in"]
+        mode = "tcp"
+        address = "127.0.0.1:9999"
+      "#,
+    )
+    .unwrap_err();
+
+    assert_eq!(err, vec!["missing field `mode` for key `sources.in`"]);
+}
+
+#[cfg(all(feature = "sources-socket", feature = "sinks-socket"))]
+#[test]
+fn missing_key2() {
+    let err = load(
+        r#"
+        [sources.in]
+        type = "socket"
+        mode = "tcp"
+
+        [sinks.out]
+        type = "socket"
+        mode = "out"
         inputs = ["in"]
         address = "127.0.0.1:9999"
       "#,
@@ -80,12 +110,14 @@ fn missing_key() {
     assert_eq!(err, vec!["missing field `address` for key `sources.in`"]);
 }
 
+#[cfg(feature = "sources-socket")]
 #[test]
 fn bad_type() {
     let err = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1234"
 
         [sinks.out]
@@ -100,12 +132,18 @@ fn bad_type() {
     assert!(err[0].starts_with("unknown variant `jabberwocky`, expected one of "));
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-sampler",
+    feature = "sinks-socket"
+))]
 #[test]
 fn nonexistant_input() {
     let err = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.sampler]
@@ -115,7 +153,8 @@ fn nonexistant_input() {
         pass_list = ["error"]
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["asdf"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -132,12 +171,18 @@ fn nonexistant_input() {
     );
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-sampler",
+    feature = "sinks-socket"
+))]
 #[test]
 fn bad_regex() {
     let err = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.sampler]
@@ -147,7 +192,8 @@ fn bad_regex() {
         pass_list = ["(["]
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["sampler"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -161,7 +207,8 @@ fn bad_regex() {
     let err = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.parser]
@@ -170,7 +217,8 @@ fn bad_regex() {
         regex = "(["
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["parser"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -182,12 +230,18 @@ fn bad_regex() {
     assert!(err[0].contains("error: unclosed character class"));
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-regex_parser",
+    feature = "sinks-socket"
+))]
 #[test]
 fn good_regex_parser() {
     let result = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.parser]
@@ -199,7 +253,8 @@ fn good_regex_parser() {
         out = "integer"
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["parser"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -209,12 +264,18 @@ fn good_regex_parser() {
     assert!(result.is_ok());
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-tokenizer",
+    feature = "sinks-socket"
+))]
 #[test]
 fn good_tokenizer() {
     let result = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.parser]
@@ -227,7 +288,8 @@ fn good_tokenizer() {
         two = "boolean"
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["parser"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -236,19 +298,19 @@ fn good_tokenizer() {
 
     assert!(result.is_ok());
 }
-
+#[cfg(all(feature = "sources-socket", feature = "sinks-aws_s3"))]
 #[test]
 fn bad_s3_region() {
     let err = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [sinks.out1]
         type = "aws_s3"
         inputs = ["in"]
-        batch_size = 100000
         compression = "gzip"
         encoding = "text"
         bucket = "asdf"
@@ -257,7 +319,6 @@ fn bad_s3_region() {
         [sinks.out2]
         type = "aws_s3"
         inputs = ["in"]
-        batch_size = 100000
         compression = "gzip"
         encoding = "text"
         bucket = "asdf"
@@ -267,7 +328,6 @@ fn bad_s3_region() {
         [sinks.out3]
         type = "aws_s3"
         inputs = ["in"]
-        batch_size = 100000
         compression = "gzip"
         encoding = "text"
         bucket = "asdf"
@@ -278,12 +338,14 @@ fn bad_s3_region() {
         [sinks.out4]
         type = "aws_s3"
         inputs = ["in"]
-        batch_size = 100000
         compression = "gzip"
         encoding = "text"
         bucket = "asdf"
         key_prefix = "logs/"
         endpoint = "this shoudlnt work"
+
+        [sinks.out4.batch]
+        max_size = 100000
       "#,
     )
     .unwrap_err();
@@ -299,16 +361,23 @@ fn bad_s3_region() {
     )
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-sampler",
+    feature = "sinks-socket"
+))]
 #[test]
 fn warnings() {
     let warnings = load(
         r#"
         [sources.in1]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [sources.in2]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1236"
 
         [transforms.sampler1]
@@ -324,7 +393,8 @@ fn warnings() {
         pass_list = ["error"]
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["sampler1"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -335,18 +405,24 @@ fn warnings() {
     assert_eq!(
         warnings,
         vec![
-            "Transform \"sampler2\" has no outputs",
-            "Source \"in2\" has no outputs",
+            "Transform \"sampler2\" has no consumers",
+            "Source \"in2\" has no consumers",
         ]
     )
 }
 
+#[cfg(all(
+    feature = "sources-socket",
+    feature = "transforms-sampler",
+    feature = "sinks-socket"
+))]
 #[test]
 fn cycle() {
     let errors = load(
         r#"
         [sources.in]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         address = "127.0.0.1:1235"
 
         [transforms.one]
@@ -374,7 +450,8 @@ fn cycle() {
         pass_list = []
 
         [sinks.out]
-        type = "tcp"
+        type = "socket"
+        mode = "tcp"
         inputs = ["four"]
         encoding = "text"
         address = "127.0.0.1:9999"
@@ -382,19 +459,25 @@ fn cycle() {
     )
     .unwrap_err();
 
-    assert_eq!(errors, vec!["Configured topology contains a cycle"])
+    assert_eq!(
+        errors,
+        vec!["Cyclic dependency detected in the chain [ four -> two -> three -> four ]"]
+    )
 }
 
+#[cfg(all(feature = "sources-socket", feature = "sinks-socket"))]
 #[test]
 fn disabled_healthcheck() {
     load(
         r#"
       [sources.in]
-      type = "tcp"
+      type = "socket"
+      mode = "tcp"
       address = "127.0.0.1:1234"
 
       [sinks.out]
-      type = "tcp"
+      type = "socket"
+      mode = "tcp"
       inputs = ["in"]
       address = "0.0.0.0:0"
       encoding = "text"
@@ -404,6 +487,7 @@ fn disabled_healthcheck() {
     .unwrap();
 }
 
+#[cfg(all(feature = "sources-stdin", feature = "sinks-http"))]
 #[test]
 fn parses_sink_no_request() {
     load(
@@ -421,6 +505,7 @@ fn parses_sink_no_request() {
     .unwrap();
 }
 
+#[cfg(all(feature = "sources-stdin", feature = "sinks-http"))]
 #[test]
 fn parses_sink_partial_request() {
     load(
@@ -433,12 +518,15 @@ fn parses_sink_partial_request() {
         inputs = ["in"]
         uri = "https://localhost"
         encoding = "json"
-        request_in_flight_limit = 42
+
+        [sinks.out.request]
+        in_flight_limit = 42
         "#,
     )
     .unwrap();
 }
 
+#[cfg(all(feature = "sources-stdin", feature = "sinks-http"))]
 #[test]
 fn parses_sink_full_request() {
     load(
@@ -451,12 +539,130 @@ fn parses_sink_full_request() {
         inputs = ["in"]
         uri = "https://localhost"
         encoding = "json"
-        request_in_flight_limit = 42
-        request_timeout_secs = 2
-        request_rate_limit_duration_secs = 3
-        request_rate_limit_num = 4
-        request_retry_attempts = 5
-        request_retry_backoff_secs = 6
+
+        [sinks.out.request]
+        in_flight_limit = 42
+        timeout_secs = 2
+        rate_limit_duration_secs = 3
+        rate_limit_num = 4
+        retry_attempts = 5
+        retry_max_duration_secs = 10
+        retry_initial_backoff_secs = 6
+        "#,
+    )
+    .unwrap();
+}
+
+#[cfg(all(feature = "sources-stdin", feature = "sinks-http"))]
+#[test]
+fn parses_sink_full_batch_bytes() {
+    load(
+        r#"
+        [sources.in]
+        type = "stdin"
+
+        [sinks.out]
+        type = "http"
+        inputs = ["in"]
+        uri = "https://localhost"
+        encoding = "json"
+
+        [sinks.out.batch]
+        max_size = 100
+        timeout_secs = 10
+        "#,
+    )
+    .unwrap();
+}
+
+#[cfg(all(feature = "sources-stdin", feature = "sinks-aws_cloudwatch_logs"))]
+#[test]
+fn parses_sink_full_batch_event() {
+    load(
+        r#"
+        [sources.in]
+        type = "stdin"
+
+        [sinks.out]
+        type = "aws_cloudwatch_logs"
+        inputs = ["in"]
+        region = "us-east-1"
+        group_name = "test"
+        stream_name = "test"
+        encoding = "json"
+
+        [sinks.out.batch]
+        max_events = 100
+        timeout_secs = 10
+        "#,
+    )
+    .unwrap();
+}
+
+#[cfg(all(feature = "sources-stdin", feature = "sinks-http"))]
+#[test]
+fn parses_sink_full_auth() {
+    load(
+        r#"
+        [sources.in]
+        type = "stdin"
+
+        [sinks.out]
+        type = "http"
+        inputs = ["in"]
+        uri = "https://localhost"
+        encoding = "json"
+
+        [sinks.out.auth]
+        strategy = "basic"
+        user = "user"
+        password = "password"
+        "#,
+    )
+    .unwrap();
+}
+
+#[cfg(all(feature = "sources-stdin", feature = "sinks-elasticsearch"))]
+#[test]
+fn parses_sink_full_es_basic_auth() {
+    load(
+        r#"
+        [sources.in]
+        type = "stdin"
+
+        [sinks.out]
+        type = "elasticsearch"
+        inputs = ["in"]
+        host = "https://localhost"
+
+        [sinks.out.auth]
+        strategy = "basic"
+        user = "user"
+        password = "password"
+        "#,
+    )
+    .unwrap();
+}
+
+#[cfg(all(
+    feature = "docker",
+    feature = "sources-stdin",
+    feature = "sinks-elasticsearch"
+))]
+#[test]
+fn parses_sink_full_es_aws() {
+    load(
+        r#"
+        [sources.in]
+        type = "stdin"
+
+        [sinks.out]
+        type = "elasticsearch"
+        inputs = ["in"]
+        host = "https://es.us-east-1.amazonaws.com"
+
+        [sinks.out.auth]
+        strategy = "aws"
         "#,
     )
     .unwrap();

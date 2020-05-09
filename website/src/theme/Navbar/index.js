@@ -1,12 +1,6 @@
-/**
- * Copyright (c) 2017-present, Facebook, Inc.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 import React, {useCallback, useState} from 'react';
 
+import GitHubButton from 'react-github-btn'
 import Link from '@docusaurus/Link';
 import Head from '@docusaurus/Head';
 import SearchBar from '@theme/SearchBar';
@@ -14,61 +8,93 @@ import SVG from 'react-inlinesvg';
 import Toggle from '@theme/Toggle';
 
 import classnames from 'classnames';
+import {fetchNewHighlight} from '@site/src/exports/newHighlight';
 import {fetchNewPost} from '@site/src/exports/newPost';
 import {fetchNewRelease} from '@site/src/exports/newRelease';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import useTheme from '@theme/hooks/useTheme';
+import useHideableNavbar from '@theme/hooks/useHideableNavbar';
+import useLockBodyScroll from '@theme/hooks/useLockBodyScroll';
+import useLogo from '@theme/hooks/useLogo';
+import useThemeContext from '@theme/hooks/useThemeContext';
 
 import styles from './styles.module.css';
 
-function navLinkAttributes(label) {
+function navLinkAttributes(label, right) {
+  let attrs = {'label': label};
+
   switch(label.toLowerCase()) {
     case 'blog':
       const newPost = fetchNewPost();
 
       if (newPost) {
-        return {
-          badge: 'new',
-          badgeStyle: 'primary',
-        };
-      } else {
-        return {};
+        attrs.badge = 'new';
+        attrs.badgeStyle = 'primary';
       }
+
+      return attrs;
+
+    case 'chat':
+      attrs.hideText = right == true;
+      attrs.icon = 'message-circle';
+      return attrs;
+
+    case 'community':
+      attrs.hideText = right == true;
+      attrs.icon = 'users';
+      return attrs;
 
     case 'download':
       const newRelease = fetchNewRelease();
 
-      let downloadAttrs = {
-        icon: 'download'
-      }
+      attrs.hideText = right == true;
+      attrs.icon = 'download';
 
       if (newRelease) {
-        downloadAttrs.badge = 'new';
-        downloadAttrs.badgeStyle = 'primary';
+        attrs.badge = 'new';
+        attrs.badgeStyle = 'primary';
       }
 
-      return downloadAttrs;
+      return attrs;
 
     case 'github':
-      return {
-        badge: '3k',
-        icon: 'github'
-      };
+      attrs.badge = '4k';
+      attrs.hideText = false;
+      attrs.icon = 'github';
+      return attrs;
+
+    case 'highlights':
+      const newHighlight = fetchNewHighlight();
+
+      if (newHighlight) {
+        attrs.badge = 'new';
+        attrs.badgeStyle = 'primary';
+      }
+
+      attrs.hideText = right == true;
+      attrs.icon = 'gift';
+      return attrs;
 
     default:
-      return {};
+      return attrs;
   };
 }
 
-function NavLink({href, hideIcon, hideText, label, to}) {
-  let attributes = navLinkAttributes(label) || {};
+function NavLink({href, hideIcon, label, onClick, position, right, to}) {
+  let attributes = navLinkAttributes(label, right) || {};
   const toUrl = useBaseUrl(to);
 
   return (
     <Link
-      className="navbar__item navbar__link"
-      title={hideText ? label : null}
+      className={classnames(
+        "navbar__item navbar__link",
+        attributes.className,
+        {
+          'navbar__item__icon_only': attributes.hideText
+        }
+      )}
+      title={attributes.hideText ? label : null}
+      onClick={onClick}
       {...(href
         ? {
             target: '_blank',
@@ -79,22 +105,30 @@ function NavLink({href, hideIcon, hideText, label, to}) {
             activeClassName: 'navbar__link--active',
             to: toUrl,
           })}>
-      {!hideIcon && attributes.icon && <><i className={`feather icon-${attributes.icon}`}></i> </>}
-      {!hideText && label}
+      {!hideIcon && attributes.icon && <><i className={`feather icon-${attributes.icon}`}></i> {attributes.iconLabel}</>}
+      {!attributes.hideText && attributes.label}
       {attributes.badge && <span className={classnames('badge', `badge--${attributes.badgeStyle || 'secondary'}`)}>{attributes.badge}</span>}
     </Link>
   );
 }
 
 function Navbar() {
-  const context = useDocusaurusContext();
+  const {
+    siteConfig: {
+      themeConfig: {
+        navbar: {title, links = [], hideOnScroll = false} = {},
+        disableDarkMode = false,
+      },
+    },
+    isClient,
+  } = useDocusaurusContext();
   const [sidebarShown, setSidebarShown] = useState(false);
   const [isSearchBarExpanded, setIsSearchBarExpanded] = useState(false);
-  const [theme, setTheme] = useTheme();
-  const {siteConfig = {}} = context;
-  const {baseUrl, themeConfig = {}} = siteConfig;
-  const {navbar = {}, disableDarkMode = false} = themeConfig;
-  const {title, logo = {}, links = []} = navbar;
+  const {isDarkTheme, setLightTheme, setDarkTheme} = useThemeContext();
+  const {navbarRef, isNavbarVisible} = useHideableNavbar(hideOnScroll);
+  const {logoLink, logoLinkProps, logoImageUrl, logoAlt} = useLogo();
+
+  useLockBodyScroll(sidebarShown);
 
   const showSidebar = useCallback(() => {
     setSidebarShown(true);
@@ -104,126 +138,124 @@ function Navbar() {
   }, [setSidebarShown]);
 
   const onToggleChange = useCallback(
-    e => setTheme(e.target.checked ? 'dark' : ''),
-    [setTheme],
+    e => (e.target.checked ? setDarkTheme() : setLightTheme()),
+    [setLightTheme, setDarkTheme],
   );
 
-  const logoUrl = useBaseUrl(logo.src);
   return (
-    <>
-      <Head>
-        {/* TODO: Do not assume that it is in english language */}
-        <html lang="en" data-theme={theme} />
-      </Head>
-      <nav
-        className={classnames('navbar', 'navbar--light', 'navbar--fixed-top', {
-          'navbar-sidebar--show': sidebarShown,
-        })}>
-        <div className="navbar__inner">
-          <div className="navbar__items navbar__items--left">
-            <div
-              aria-label="Navigation bar toggle"
-              className="navbar__toggle"
-              role="button"
-              tabIndex={0}
-              onClick={showSidebar}
-              onKeyDown={showSidebar}>
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="30"
-                height="30"
-                viewBox="0 0 30 30"
-                role="img"
-                focusable="false">
-                <title>Menu</title>
-                <path
-                  stroke="currentColor"
-                  strokeLinecap="round"
-                  strokeMiterlimit="10"
-                  strokeWidth="2"
-                  d="M4 7h22M4 15h22M4 23h22"
-                />
-              </svg>
-            </div>
-            <Link className="navbar__brand" to={baseUrl}>
-              {logo != null && (
-                <SVG className="navbar__logo" src={logoUrl} alt={logo.alt} />
-              )}
-              {title != null && (
-                <strong
-                  className={isSearchBarExpanded ? styles.hideLogoText : ''}>
-                  {title}
-                </strong>
-              )}
-            </Link>
-            {links
-              .filter(linkItem => linkItem.position !== 'right')
-              .map((linkItem, i) => (
-                <NavLink {...linkItem} key={i} />
-              ))}
-          </div>
-          <div className="navbar__items navbar__items--right">
-            {links
-              .filter(linkItem => linkItem.position === 'right')
-              .map((linkItem, i) => (
-                <NavLink {...linkItem} hideText={true} key={i} />
-              ))}
-            {!disableDarkMode && (
-              <Toggle
-                className={styles.displayOnlyInLargeViewport}
-                aria-label="Dark mode toggle"
-                checked={theme === 'dark'}
-                onChange={onToggleChange}
+    <nav
+      ref={navbarRef}
+      className={classnames('navbar', 'navbar--light', 'navbar--fixed-top', {
+        'navbar-sidebar--show': sidebarShown,
+        [styles.navbarHideable]: hideOnScroll,
+        [styles.navbarHidden]: !isNavbarVisible,
+      })}>
+      <div className="navbar__inner">
+        <div className="navbar__items">
+          <div
+            aria-label="Navigation bar toggle"
+            className="navbar__toggle"
+            role="button"
+            tabIndex={0}
+            onClick={showSidebar}
+            onKeyDown={showSidebar}>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="30"
+              height="30"
+              viewBox="0 0 30 30"
+              role="img"
+              focusable="false">
+              <title>Menu</title>
+              <path
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeMiterlimit="10"
+                strokeWidth="2"
+                d="M4 7h22M4 15h22M4 23h22"
               />
+            </svg>
+          </div>
+          <Link className="navbar__brand" to={logoLink} {...logoLinkProps}>
+            {logoImageUrl != null && (
+              <SVG className="navbar__logo" src={logoImageUrl} alt={logoAlt} />
             )}
-            <SearchBar
-              handleSearchBarToggle={setIsSearchBarExpanded}
-              isSearchBarExpanded={isSearchBarExpanded}
+            {title != null && (
+              <strong
+                className={isSearchBarExpanded ? styles.hideLogoText : ''}>
+                {title}
+              </strong>
+            )}
+          </Link>
+          {links
+            .filter(linkItem => linkItem.position !== 'right')
+            .map((linkItem, i) => (
+              <NavLink {...linkItem} left={true} key={i} />
+            ))}
+        </div>
+        <div className="navbar__items navbar__items--right">
+          {links
+            .filter(linkItem => linkItem.position === 'right')
+            .map((linkItem, i) => (
+              <NavLink {...linkItem} right={true} key={i} />
+            ))}
+          {!disableDarkMode && (
+            <Toggle
+              className={styles.displayOnlyInLargeViewport}
+              aria-label="Dark mode toggle"
+              checked={isDarkTheme}
+              onChange={onToggleChange}
             />
-          </div>
+          )}
+          <SearchBar
+            handleSearchBarToggle={setIsSearchBarExpanded}
+            isSearchBarExpanded={isSearchBarExpanded}
+          />
         </div>
-        <div
-          role="presentation"
-          className="navbar-sidebar__backdrop"
-          onClick={() => {
-            setSidebarShown(false);
-          }}
-        />
-        <div className="navbar-sidebar">
-          <div className="navbar-sidebar__brand">
-            <Link className="navbar__brand" onClick={hideSidebar} to={baseUrl}>
-              {logo != null && (
-                <SVG className="navbar__logo" src={logoUrl} alt={logo.alt} />
-              )}
-              {title != null && <strong>{title}</strong>}
-            </Link>
-            {!disableDarkMode && sidebarShown && (
-              <Toggle
-                aria-label="Dark mode toggle in sidebar"
-                checked={theme === 'dark'}
-                onChange={onToggleChange}
-              />
+      </div>
+      <div
+        role="presentation"
+        className="navbar-sidebar__backdrop"
+        onClick={hideSidebar}
+      />
+      <div className="navbar-sidebar">
+        <div className="navbar-sidebar__brand">
+          <Link
+            className="navbar__brand"
+            onClick={hideSidebar}
+            to={logoLink}
+            {...logoLinkProps}>
+            {logoImageUrl != null && (
+              <SVG className="navbar__logo" src={logoImageUrl} alt={logoAlt} />
             )}
-          </div>
-          <div className="navbar-sidebar__items">
-            <div className="menu">
-              <ul className="menu__list">
-                {links.map((linkItem, i) => (
-                  <li className="menu__list-item" key={i}>
-                    <NavLink
-                      className="menu__link"
-                      {...linkItem}
-                      hideIcon={true}
-                      onClick={hideSidebar}
-                    />
-                  </li>
-                ))}
-              </ul>
-            </div>
+            {title != null && <strong>{title}</strong>}
+          </Link>
+          {!disableDarkMode && sidebarShown && (
+            <Toggle
+              aria-label="Dark mode toggle in sidebar"
+              checked={isDarkTheme}
+              onChange={onToggleChange}
+            />
+          )}
+        </div>
+        <div className="navbar-sidebar__items">
+          <div className="menu">
+            <ul className="menu__list">
+              {links.map((linkItem, i) => (
+                <li className="menu__list-item" key={i}>
+                  <NavLink
+                    className="menu__link"
+                    {...linkItem}
+                    hideIcon={true}
+                    onClick={hideSidebar}
+                  />
+                </li>
+              ))}
+            </ul>
           </div>
         </div>
-      </nav>
-    </>
+      </div>
+    </nav>
   );
 }
 

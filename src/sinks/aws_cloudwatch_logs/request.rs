@@ -1,5 +1,5 @@
 use super::CloudwatchError;
-use futures::{sync::oneshot, try_ready, Async, Future, Poll};
+use futures01::{sync::oneshot, try_ready, Async, Future, Poll};
 use rusoto_core::{RusotoError, RusotoFuture};
 use rusoto_logs::{
     CloudWatchLogs, CloudWatchLogsClient, CreateLogGroupError, CreateLogGroupRequest,
@@ -13,7 +13,7 @@ pub struct CloudwatchFuture {
     state: State,
     create_missing_group: bool,
     create_missing_stream: bool,
-    events: Option<Vec<InputLogEvent>>,
+    events: Vec<Vec<InputLogEvent>>,
     token_tx: Option<oneshot::Sender<Option<String>>>,
 }
 
@@ -31,13 +31,14 @@ enum State {
 }
 
 impl CloudwatchFuture {
+    /// Panics if events.is_empty()
     pub fn new(
         client: CloudWatchLogsClient,
         stream_name: String,
         group_name: String,
         create_missing_group: bool,
         create_missing_stream: bool,
-        events: Vec<InputLogEvent>,
+        mut events: Vec<Vec<InputLogEvent>>,
         token: Option<String>,
         token_tx: oneshot::Sender<Option<String>>,
     ) -> Self {
@@ -47,12 +48,10 @@ impl CloudwatchFuture {
             group_name,
         };
 
-        let (state, events) = if let Some(token) = token {
-            let state = State::Put(client.put_logs(Some(token), events));
-            (state, None)
+        let state = if let Some(token) = token {
+            State::Put(client.put_logs(Some(token), events.pop().expect("No Events to send")))
         } else {
-            let state = State::DescribeStream(client.describe_stream());
-            (state, Some(events))
+            State::DescribeStream(client.describe_stream())
         };
 
         Self {
@@ -102,19 +101,19 @@ impl Future for CloudwatchFuture {
                         .into_iter()
                         .next()
                     {
-                        trace!(message = "stream found", stream = ?stream.log_stream_name);
+                        debug!(message = "stream found", stream = ?stream.log_stream_name);
 
                         let events = self
                             .events
-                            .take()
-                            .expect("Token got called twice, this is a bug!");
+                            .pop()
+                            .expect("Token got called multiple times, this is a bug!");
 
                         let token = stream.upload_sequence_token;
 
-                        trace!(message = "putting logs.", ?token);
+                        info!(message = "putting logs.", ?token);
                         self.state = State::Put(self.client.put_logs(token, events));
                     } else if self.create_missing_stream {
-                        debug!("provided stream does not exist; creating a new one.");
+                        info!("provided stream does not exist; creating a new one.");
                         self.state = State::CreateStream(self.client.create_log_stream());
                     } else {
                         return Err(CloudwatchError::NoStreamsFound);
@@ -122,9 +121,21 @@ impl Future for CloudwatchFuture {
                 }
 
                 State::CreateGroup(fut) => {
-                    try_ready!(fut.poll().map_err(CloudwatchError::CreateGroup));
+                    try_ready!(fut
+                        .poll()
+                        .or_else(|e| {
+                            if let RusotoError::Service(
+                                CreateLogGroupError::ResourceAlreadyExists(_),
+                            ) = e
+                            {
+                                Ok(Async::Ready(()))
+                            } else {
+                                Err(e)
+                            }
+                        })
+                        .map_err(CloudwatchError::CreateGroup));
 
-                    trace!("group created.");
+                    info!(message = "group created.", name = %self.client.group_name);
 
                     // This does not abide by `create_missing_stream` since a group
                     // never has any streams and thus we need to create one if a group
@@ -133,9 +144,21 @@ impl Future for CloudwatchFuture {
                 }
 
                 State::CreateStream(fut) => {
-                    try_ready!(fut.poll().map_err(CloudwatchError::CreateStream));
+                    try_ready!(fut
+                        .poll()
+                        .or_else(|e| {
+                            if let RusotoError::Service(
+                                CreateLogStreamError::ResourceAlreadyExists(_),
+                            ) = e
+                            {
+                                Ok(Async::Ready(()))
+                            } else {
+                                Err(e)
+                            }
+                        })
+                        .map_err(CloudwatchError::CreateStream));
 
-                    trace!("stream created.");
+                    info!(message = "stream created.", name = %self.client.stream_name);
 
                     self.state = State::DescribeStream(self.client.describe_stream());
                 }
@@ -145,15 +168,20 @@ impl Future for CloudwatchFuture {
 
                     let next_token = res.next_sequence_token;
 
-                    trace!(message = "putting logs was successful.", ?next_token);
+                    if let Some(events) = self.events.pop() {
+                        debug!(message = "putting logs.", ?next_token);
+                        self.state = State::Put(self.client.put_logs(next_token, events));
+                    } else {
+                        info!(message = "putting logs was successful.", ?next_token);
 
-                    self.token_tx
-                        .take()
-                        .expect("Put was polled twice.")
-                        .send(next_token)
-                        .expect("CloudwatchLogsSvc was dropped unexpectedly");
+                        self.token_tx
+                            .take()
+                            .expect("Put was polled after finishing.")
+                            .send(next_token)
+                            .expect("CloudwatchLogsSvc was dropped unexpectedly");
 
-                    return Ok(().into());
+                        return Ok(().into());
+                    }
                 }
             }
         }

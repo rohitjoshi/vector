@@ -1,8 +1,12 @@
 use crate::{
-    sinks::http::{Encoding, HttpMethod, HttpSinkConfig},
-    sinks::util::{BatchConfig, Compression, TowerRequestConfig},
+    sinks::http::{HttpMethod, HttpSinkConfig},
+    sinks::util::{
+        encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+        BatchBytesConfig, Compression, TowerRequestConfig,
+    },
     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
 };
+use http::Uri;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -24,21 +28,46 @@ pub enum NewRelicLogsRegion {
     Eu,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[derive(Deserialize, Serialize, Debug, Derivative, Clone)]
+#[derivative(Default)]
 pub struct NewRelicLogsConfig {
     pub license_key: Option<String>,
     pub insert_key: Option<String>,
     pub region: Option<NewRelicLogsRegion>,
+    #[serde(skip_serializing_if = "skip_serializing_if_default", default)]
+    pub encoding: EncodingConfigWithDefault<Encoding>,
+    #[serde(default)]
+    pub batch: BatchBytesConfig,
 
-    #[serde(default, flatten)]
-    pub batch: BatchConfig,
-
-    #[serde(flatten)]
+    #[serde(default)]
     pub request: TowerRequestConfig,
 }
 
 inventory::submit! {
     SinkDescription::new::<NewRelicLogsConfig>("new_relic_logs")
+}
+
+#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone, Derivative)]
+#[serde(rename_all = "snake_case")]
+#[derivative(Default)]
+pub enum Encoding {
+    #[derivative(Default)]
+    Json,
+}
+
+impl From<Encoding> for crate::sinks::http::Encoding {
+    fn from(v: Encoding) -> crate::sinks::http::Encoding {
+        match v {
+            Encoding::Json => crate::sinks::http::Encoding::Json,
+        }
+    }
+}
+
+// There is another one of these in `util::encoding`, but this one is specialized for New Relic.
+/// For encodings, answers "Is it possible to skip serializing this value, because it's the
+/// default?"
+pub(crate) fn skip_serializing_if_default(e: &EncodingConfigWithDefault<Encoding>) -> bool {
+    e.codec() == &Encoding::default()
 }
 
 #[typetag::serde(name = "new_relic_logs")]
@@ -70,37 +99,33 @@ impl NewRelicLogsConfig {
         }
 
         let uri = match self.region.as_ref().unwrap_or(&NewRelicLogsRegion::Us) {
-            NewRelicLogsRegion::Us => "https://log-api.newrelic.com/log/v1",
-            NewRelicLogsRegion::Eu => "https://log-api.eu.newrelic.com/log/v1",
+            NewRelicLogsRegion::Us => Uri::from_static("https://log-api.newrelic.com/log/v1"),
+            NewRelicLogsRegion::Eu => Uri::from_static("https://log-api.eu.newrelic.com/log/v1"),
         };
 
-        let batch = BatchConfig {
+        let batch = BatchBytesConfig {
             // The max request size is 10MiB, so in order to be comfortably
             // within this we batch up to 5MiB.
-            batch_size: Some(
-                self.batch
-                    .batch_size
-                    .unwrap_or(bytesize::mib(5u64) as usize),
-            ),
+            max_size: Some(self.batch.max_size.unwrap_or(bytesize::mib(5u64) as usize)),
             ..self.batch
         };
 
         let request = TowerRequestConfig {
             // The default throughput ceiling defaults are relatively
             // conservative so we crank them up for New Relic.
-            request_in_flight_limit: Some(self.request.request_in_flight_limit.unwrap_or(100)),
-            request_rate_limit_num: Some(self.request.request_rate_limit_num.unwrap_or(100)),
+            in_flight_limit: Some(self.request.in_flight_limit.unwrap_or(100)),
+            rate_limit_num: Some(self.request.rate_limit_num.unwrap_or(100)),
             ..self.request
         };
 
         Ok(HttpSinkConfig {
-            uri: uri.to_owned(),
+            uri: uri.into(),
             method: Some(HttpMethod::Post),
             healthcheck_uri: None,
-            basic_auth: None,
+            auth: None,
             headers: Some(headers),
             compression: Some(Compression::None),
-            encoding: Encoding::Json,
+            encoding: self.encoding.clone().without_default(),
 
             batch,
             request,
@@ -120,7 +145,7 @@ mod tests {
         topology::config::SinkConfig,
     };
     use bytes::Buf;
-    use futures::{stream, sync::mpsc, Future, Sink, Stream};
+    use futures01::{stream, sync::mpsc, Future, Sink, Stream};
     use hyper::service::service_fn_ok;
     use hyper::{Body, Request, Response, Server};
     use serde_json::Value;
@@ -144,21 +169,24 @@ mod tests {
         nr_config.license_key = Some("foo".to_owned());
         let http_config = nr_config.create_config().unwrap();
 
-        assert_eq!(http_config.uri, "https://log-api.newrelic.com/log/v1");
-        assert_eq!(http_config.method, Some(HttpMethod::Post));
-        assert_eq!(http_config.encoding, Encoding::Json);
         assert_eq!(
-            http_config.batch.batch_size,
+            format!("{}", http_config.uri),
+            "https://log-api.newrelic.com/log/v1".to_string()
+        );
+        assert_eq!(http_config.method, Some(HttpMethod::Post));
+        assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+        assert_eq!(
+            http_config.batch.max_size,
             Some(bytesize::mib(5u64) as usize)
         );
-        assert_eq!(http_config.request.request_in_flight_limit, Some(100));
-        assert_eq!(http_config.request.request_rate_limit_num, Some(100));
+        assert_eq!(http_config.request.in_flight_limit, Some(100));
+        assert_eq!(http_config.request.rate_limit_num, Some(100));
         assert_eq!(
             http_config.headers.unwrap()["X-License-Key"],
             "foo".to_owned()
         );
         assert!(http_config.tls.is_none());
-        assert!(http_config.basic_auth.is_none());
+        assert!(http_config.auth.is_none());
     }
 
     #[test]
@@ -166,27 +194,30 @@ mod tests {
         let mut nr_config = NewRelicLogsConfig::default();
         nr_config.insert_key = Some("foo".to_owned());
         nr_config.region = Some(NewRelicLogsRegion::Eu);
-        nr_config.batch.batch_size = Some(bytesize::mib(8u64) as usize);
-        nr_config.request.request_in_flight_limit = Some(12);
-        nr_config.request.request_rate_limit_num = Some(24);
+        nr_config.batch.max_size = Some(bytesize::mib(8u64) as usize);
+        nr_config.request.in_flight_limit = Some(12);
+        nr_config.request.rate_limit_num = Some(24);
 
         let http_config = nr_config.create_config().unwrap();
 
-        assert_eq!(http_config.uri, "https://log-api.eu.newrelic.com/log/v1");
-        assert_eq!(http_config.method, Some(HttpMethod::Post));
-        assert_eq!(http_config.encoding, Encoding::Json);
         assert_eq!(
-            http_config.batch.batch_size,
+            format!("{}", http_config.uri),
+            "https://log-api.eu.newrelic.com/log/v1".to_string()
+        );
+        assert_eq!(http_config.method, Some(HttpMethod::Post));
+        assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+        assert_eq!(
+            http_config.batch.max_size,
             Some(bytesize::mib(8u64) as usize)
         );
-        assert_eq!(http_config.request.request_in_flight_limit, Some(12));
-        assert_eq!(http_config.request.request_rate_limit_num, Some(24));
+        assert_eq!(http_config.request.in_flight_limit, Some(12));
+        assert_eq!(http_config.request.rate_limit_num, Some(24));
         assert_eq!(
             http_config.headers.unwrap()["X-Insert-Key"],
             "foo".to_owned()
         );
         assert!(http_config.tls.is_none());
-        assert!(http_config.basic_auth.is_none());
+        assert!(http_config.auth.is_none());
     }
 
     #[test]
@@ -194,29 +225,36 @@ mod tests {
         let config = r#"
         insert_key = "foo"
         region = "eu"
-        batch_size = 8388608
-        request_in_flight_limit = 12
-        request_rate_limit_num = 24
+
+        [batch]
+        max_size = 8388608
+
+        [request]
+        in_flight_limit = 12
+        rate_limit_num = 24
     "#;
         let nr_config: NewRelicLogsConfig = toml::from_str(&config).unwrap();
 
         let http_config = nr_config.create_config().unwrap();
 
-        assert_eq!(http_config.uri, "https://log-api.eu.newrelic.com/log/v1");
-        assert_eq!(http_config.method, Some(HttpMethod::Post));
-        assert_eq!(http_config.encoding, Encoding::Json);
         assert_eq!(
-            http_config.batch.batch_size,
+            format!("{}", http_config.uri),
+            "https://log-api.eu.newrelic.com/log/v1".to_string()
+        );
+        assert_eq!(http_config.method, Some(HttpMethod::Post));
+        assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+        assert_eq!(
+            http_config.batch.max_size,
             Some(bytesize::mib(8u64) as usize)
         );
-        assert_eq!(http_config.request.request_in_flight_limit, Some(12));
-        assert_eq!(http_config.request.request_rate_limit_num, Some(24));
+        assert_eq!(http_config.request.in_flight_limit, Some(12));
+        assert_eq!(http_config.request.rate_limit_num, Some(24));
         assert_eq!(
             http_config.headers.unwrap()["X-Insert-Key"],
             "foo".to_owned()
         );
         assert!(http_config.tls.is_none());
-        assert!(http_config.basic_auth.is_none());
+        assert!(http_config.auth.is_none());
     }
 
     fn build_test_server(
@@ -233,7 +271,7 @@ mod tests {
                 let (parts, body) = req.into_parts();
 
                 let tx = tx.clone();
-                tokio::spawn(
+                tokio01::spawn(
                     body.concat2()
                         .map_err(|e| panic!(e))
                         .and_then(|body| tx.send((parts, body)))
@@ -261,7 +299,10 @@ mod tests {
         let mut nr_config = NewRelicLogsConfig::default();
         nr_config.license_key = Some("foo".to_owned());
         let mut http_config = nr_config.create_config().unwrap();
-        http_config.uri = format!("http://{}/fake_nr", in_addr);
+        http_config.uri = format!("http://{}/fake_nr", in_addr)
+            .parse::<http::Uri>()
+            .unwrap()
+            .into();
 
         let mut rt = Runtime::new().unwrap();
 

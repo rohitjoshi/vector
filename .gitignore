@@ -4,8 +4,10 @@
 .envrc
 .DS_Store
 .idea/
+.vscode/
 checkpoints/*
 logs*/
 miniodat
 sample.log
 target
+node_modules

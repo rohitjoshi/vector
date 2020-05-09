@@ -1,6 +1,11 @@
 ---
+last_modified_on: "2020-04-05"
 title: Guarantees
+description: Vector's gaurantees. Covering delivery and reliability guarantees for each Vector component.
 ---
+
+import Alert from '@site/src/components/Alert';
+import Jump from '@site/src/components/Jump';
 
 Faults in distributed systems are like green Skittles, we all wish they'd never
 happen but in reality the best we can do is understand and control the damage
@@ -27,29 +32,23 @@ support specific guarantees.
 
 ## Delivery Guarantees
 
-<div class="section-list">
-<div class="section">
+<ul class="connected-list">
+<li>
 
 ### At-Least-Once
 
 The `at-least-once` delivery guarantee ensures that an
-[event][docs.data-model#event] received by Vector will be delivered at least
+[event][docs.data-model] received by Vector will be delivered at least
 once to the configured destination(s). While rare, it is possible for an event
 to be delivered more than once. See the [Does Vector support exactly once
 delivery](#does-vector-support-exactly-once-delivery) FAQ below).
-
-import Alert from '@site/src/components/Alert';
 
 <Alert type="warning">
 
 In order to achieve at least once delivery between restarts your source must
 be configured to use `disk` based buffers:
 
-import CodeHeader from '@site/src/components/CodeHeader';
-
-<CodeHeader fileName="vector.toml" learnMoreUrl="/docs/setup/configuration/" />
-
-```toml
+```toml title="vector.toml"
 [sinks.my_sink_id]
   # ...
 
@@ -63,18 +62,14 @@ Refer to each [sink's][docs.sinks] documentation for further guidance on its
 buffer options.
 
 </Alert>
-
-import Jump from '@site/src/components/Jump';
-
 <Jump to="/components/?at-least-once=true">View all at-least-once components</Jump>
-
-</div>
-<div class="section">
+</li>
+<li>
 
 ### Best-Effort
 
 A `best-effort` delivery guarantee means that Vector will make a best effort to
-deliver each event, but cannot _guarantee_ delivery. This is usually due to 
+deliver each event, but cannot _guarantee_ delivery. This is usually due to
 limitations of the underlying protocol; outside the scope of Vector. It's
 important to note that while data loss is possible, it is usually rare and
 Vector does everything within it's control to ensure data is not lost. For more
@@ -84,13 +79,13 @@ info, see the
 Note that this is _not_ the same as at-most-once delivery, as it is still
 possible for Vector to introduce duplicates under extreme circumstances.
 
-</div>
-</div>
+</li>
+</ul>
 
 ## Reliability Guarantee
 
-<div class="section-list">
-<div class="section">
+<ul class="connected-list">
+<li>
 
 ### Prod-Ready
 
@@ -102,12 +97,12 @@ environments. A feature is `prod-ready` if it meets the following criteria:
    a production environment for sustained periods without issue.
 2. The feature has had sufficient time (generally >4 months) to be community
    tested.
-3. There are no major [open bugs][urls.vector_bug_issues] for the feature.
+3. The feature API is stable and unlikely to change.
+4. There are no major [open bugs][urls.vector_bug_issues] for the feature.
 
 <Jump to="/components/?prod-ready=true">View all prod-ready components</Jump>
-
-</div>
-<div class="section">
+</li>
+<li>
 
 ### Beta
 
@@ -115,8 +110,8 @@ The `beta` status means that a feature has not met the criteria outlined in
 the [Prod-Ready](#prod-ready) section and therefore should be used with caution
 in production environments.
 
-</div>
-</div>
+</li>
+</ul>
 
 ## FAQs
 
@@ -150,7 +145,7 @@ Head over to the [components section][pages.components] and use the guarantee
 filters.
 
 
-[docs.data-model#event]: /docs/about/data-model/#event
+[docs.data-model]: /docs/about/data-model/
 [docs.sinks]: /docs/reference/sinks/
 [pages.components]: /components/
 [urls.vector_bug_issues]: https://github.com/timberio/vector/issues?q=is%3Aopen+is%3Aissue+label%3A%22type%3A+bug%22

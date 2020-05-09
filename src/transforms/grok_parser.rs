@@ -1,9 +1,8 @@
 use super::Transform;
 use crate::{
-    event::{self, Event},
-    runtime::TaskExecutor,
-    topology::config::{DataType, TransformConfig, TransformDescription},
-    types::{parse_conversion_map, Conversion},
+    event::{self, Event, PathComponent, PathIter},
+    topology::config::{DataType, TransformConfig, TransformContext, TransformDescription},
+    types::{parse_conversion_map_no_atoms, Conversion},
 };
 use grok::Pattern;
 use serde::{Deserialize, Serialize};
@@ -26,7 +25,7 @@ pub struct GrokParserConfig {
     pub field: Option<Atom>,
     #[derivative(Default(value = "true"))]
     pub drop_field: bool,
-    pub types: HashMap<Atom, String>,
+    pub types: HashMap<String, String>,
 }
 
 inventory::submit! {
@@ -35,12 +34,15 @@ inventory::submit! {
 
 #[typetag::serde(name = "grok_parser")]
 impl TransformConfig for GrokParserConfig {
-    fn build(&self, _exec: TaskExecutor) -> crate::Result<Box<dyn Transform>> {
-        let field = self.field.as_ref().unwrap_or(&event::MESSAGE);
+    fn build(&self, _cx: TransformContext) -> crate::Result<Box<dyn Transform>> {
+        let field = self
+            .field
+            .as_ref()
+            .unwrap_or(&event::log_schema().message_key());
 
         let mut grok = grok::Grok::with_patterns();
 
-        let types = parse_conversion_map(&self.types)?;
+        let types = parse_conversion_map_no_atoms(&self.types)?;
 
         Ok(grok
             .compile(&self.pattern, true)
@@ -50,6 +52,7 @@ impl TransformConfig for GrokParserConfig {
                     field: field.clone(),
                     drop_field: self.drop_field,
                     types,
+                    paths: HashMap::new(),
                 })
             })
             .context(InvalidGrok)?)
@@ -72,7 +75,8 @@ pub struct GrokParser {
     pattern: Pattern,
     field: Atom,
     drop_field: bool,
-    types: HashMap<Atom, Conversion>,
+    types: HashMap<String, Conversion>,
+    paths: HashMap<String, Vec<PathComponent>>,
 }
 
 impl Transform for GrokParser {
@@ -84,14 +88,21 @@ impl Transform for GrokParser {
             if let Some(matches) = self.pattern.match_against(&value) {
                 let drop_field = self.drop_field && !matches.get(&self.field).is_some();
                 for (name, value) in matches.iter() {
-                    let name: Atom = name.into();
-                    let conv = self.types.get(&name).unwrap_or(&Conversion::Bytes);
+                    let conv = self.types.get(name).unwrap_or(&Conversion::Bytes);
                     match conv.convert(value.into()) {
-                        Ok(value) => event.insert_explicit(name, value),
+                        Ok(value) => {
+                            if let Some(path) = self.paths.get(name) {
+                                event.insert_path(path.to_vec(), value);
+                            } else {
+                                let path = PathIter::new(name).collect::<Vec<_>>();
+                                self.paths.insert(name.to_string(), path.clone());
+                                event.insert_path(path, value);
+                            }
+                        }
                         Err(error) => {
                             debug!(
                                 message = "Could not convert types.",
-                                name = &name[..],
+                                %name,
                                 %error,
                                 rate_limit_secs = 30,
                             );
@@ -121,7 +132,11 @@ impl Transform for GrokParser {
 mod tests {
     use super::GrokParserConfig;
     use crate::event::LogEvent;
-    use crate::{event, topology::config::TransformConfig, Event};
+    use crate::{
+        event,
+        topology::config::{TransformConfig, TransformContext},
+        Event,
+    };
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -140,7 +155,7 @@ mod tests {
             drop_field,
             types: types.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
         }
-        .build(rt.executor())
+        .build(TransformContext::new_test(rt.executor()))
         .unwrap();
         parser.transform(event).unwrap().into_log()
     }
@@ -183,10 +198,15 @@ mod tests {
 
         assert_eq!(2, event.keys().count());
         assert_eq!(
-            event::ValueKind::from("help i'm stuck in an http server"),
-            event[&event::MESSAGE]
+            event::Value::from("help i'm stuck in an http server"),
+            event[&event::log_schema().message_key()]
         );
-        assert!(event[&event::TIMESTAMP].to_string_lossy().len() > 0);
+        assert!(
+            event[&event::log_schema().timestamp_key()]
+                .to_string_lossy()
+                .len()
+                > 0
+        );
     }
 
     #[test]
@@ -228,10 +248,15 @@ mod tests {
 
         assert_eq!(2, event.keys().count());
         assert_eq!(
-            event::ValueKind::from("i am the only field"),
-            event[&event::MESSAGE]
+            event::Value::from("i am the only field"),
+            event[&event::log_schema().message_key()]
         );
-        assert!(event[&event::TIMESTAMP].to_string_lossy().len() > 0);
+        assert!(
+            event[&event::log_schema().timestamp_key()]
+                .to_string_lossy()
+                .len()
+                > 0
+        );
     }
 
     #[test]

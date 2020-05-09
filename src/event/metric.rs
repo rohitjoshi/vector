@@ -1,14 +1,15 @@
 use chrono::{DateTime, Utc};
 use derive_is_enum_variant::is_enum_variant;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Metric {
     pub name: String,
     pub timestamp: Option<DateTime<Utc>>,
-    pub tags: Option<HashMap<String, String>>,
+    pub tags: Option<BTreeMap<String, String>>,
     pub kind: MetricKind,
+    #[serde(flatten)]
     pub value: MetricValue,
 }
 
@@ -20,7 +21,7 @@ pub enum MetricKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, is_enum_variant)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum MetricValue {
     Counter {
         value: f64,
@@ -29,7 +30,7 @@ pub enum MetricValue {
         value: f64,
     },
     Set {
-        values: HashSet<String>,
+        values: BTreeSet<String>,
     },
     Distribution {
         values: Vec<f64>,
@@ -66,24 +67,13 @@ impl Metric {
         }
 
         match (&mut self.value, &other.value) {
-            (
-                MetricValue::Counter { ref mut value, .. },
-                MetricValue::Counter { value: value2, .. },
-            ) => {
+            (MetricValue::Counter { ref mut value }, MetricValue::Counter { value: value2 }) => {
                 *value += value2;
             }
-            (
-                MetricValue::Gauge { ref mut value, .. },
-                MetricValue::Gauge { value: value2, .. },
-            ) => {
+            (MetricValue::Gauge { ref mut value }, MetricValue::Gauge { value: value2 }) => {
                 *value += value2;
             }
-            (
-                MetricValue::Set { ref mut values, .. },
-                MetricValue::Set {
-                    values: values2, ..
-                },
-            ) => {
+            (MetricValue::Set { ref mut values }, MetricValue::Set { values: values2 }) => {
                 for val in values2 {
                     values.insert(val.to_string());
                 }
@@ -92,12 +82,10 @@ impl Metric {
                 MetricValue::Distribution {
                     ref mut values,
                     ref mut sample_rates,
-                    ..
                 },
                 MetricValue::Distribution {
                     values: values2,
                     sample_rates: sample_rates2,
-                    ..
                 },
             ) => {
                 values.extend_from_slice(&values2);
@@ -128,6 +116,51 @@ impl Metric {
             _ => {}
         }
     }
+
+    pub fn reset(&mut self) {
+        match &mut self.value {
+            MetricValue::Counter { ref mut value } => {
+                *value = 0.0;
+            }
+            MetricValue::Gauge { ref mut value } => {
+                *value = 0.0;
+            }
+            MetricValue::Set { ref mut values } => {
+                values.clear();
+            }
+            MetricValue::Distribution {
+                ref mut values,
+                ref mut sample_rates,
+            } => {
+                values.clear();
+                sample_rates.clear();
+            }
+            MetricValue::AggregatedHistogram {
+                ref mut counts,
+                ref mut count,
+                ref mut sum,
+                ..
+            } => {
+                for c in counts.iter_mut() {
+                    *c = 0;
+                }
+                *count = 0;
+                *sum = 0.0;
+            }
+            MetricValue::AggregatedSummary {
+                ref mut values,
+                ref mut count,
+                ref mut sum,
+                ..
+            } => {
+                for v in values.iter_mut() {
+                    *v = 0.0;
+                }
+                *count = 0;
+                *sum = 0.0;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,7 +172,7 @@ mod test {
         Utc.ymd(2018, 11, 14).and_hms_nano(8, 9, 10, 11)
     }
 
-    fn tags() -> HashMap<String, String> {
+    fn tags() -> BTreeMap<String, String> {
         vec![
             ("normal_tag".to_owned(), "value".to_owned()),
             ("true_tag".to_owned(), "true".to_owned()),

@@ -1,9 +1,15 @@
+require "erb"
+
 require "ostruct"
 require "toml-rb"
 
 require_relative "metadata/batching_sink"
+require_relative "metadata/data_model"
 require_relative "metadata/exposing_sink"
 require_relative "metadata/field"
+require_relative "metadata/guides"
+require_relative "metadata/highlight"
+require_relative "metadata/installation"
 require_relative "metadata/links"
 require_relative "metadata/post"
 require_relative "metadata/release"
@@ -16,27 +22,98 @@ require_relative "metadata/transform"
 # This represents the /.meta directory in object form. Sub-classes represent
 # each sub-component.
 class Metadata
-  class << self
-    def load!(meta_dir, docs_root, pages_root)
-      metadata = {}
+  module Template
+    extend self
 
-      Dir.glob("#{meta_dir}/**/*.toml").each do |file|
-        hash = TomlRB.load_file(file)
-        metadata.deep_merge!(hash)
+    def render(path, args = {})
+      context = binding
+
+      args.each do |key, value|
+        context.local_variable_set("#{key}", value)
       end
 
-      new(metadata, docs_root, pages_root)
+      full_path = path.start_with?("/") ? path : "#{META_ROOT}/#{path}"
+
+      if !File.exists?(full_path) && File.exists?("#{full_path}.erb")
+        full_path = "#{full_path}.erb"
+      end
+
+      body = File.read(full_path)
+      renderer = ERB.new(body, nil, '-')
+
+      renderer.result(context)
     end
   end
 
+  class << self
+    def load!(meta_dir, docs_root, guides_root, pages_root)
+      metadata = load_metadata!(meta_dir)
+      validate_schema!(metadata)
+      new(metadata, docs_root, guides_root, pages_root)
+    end
+
+    private
+      def load_metadata!(meta_dir)
+        metadata = {}
+
+        contents =
+          Dir.glob("#{meta_dir}/**/[^_]*.{toml,toml.erb}").
+            sort.
+            unshift("#{meta_dir}/root.toml"). # move to the front
+            uniq.
+            collect do |file|
+              begin
+                Template.render(file)
+              rescue Exception => e
+                Printer.error!(
+                  <<~EOF
+                  The follow metadata file failed to load:
+
+                    #{file}
+
+                  The error received was:
+
+                    #{e.message}
+                    #{e.backtrace.join("\n  ")}
+                  EOF
+                )
+              end
+            end
+
+        content = contents.join("\n")
+        TomlRB.parse(content)
+      end
+
+      def validate_schema!(metadata)
+        errors = metadata.validate_schema
+
+        if errors.any?
+          Printer.error!(
+            <<~EOF
+            The resulting hash from the `/.meta/**/*.toml` files failed
+            validation against the following schema:
+
+                /.meta/schema/meta.json
+
+            The errors include:
+
+                * #{errors[0..50].join("\n*    ")}
+            EOF
+          )
+        end
+      end
+  end
+
   attr_reader :blog_posts,
-  :env_vars,
+    :data_model,
+    :domains,
+    :env_vars,
+    :guides,
+    :highlights,
     :installation,
     :links,
-    :log_fields,
-    :metric_fields,
     :options,
-    :testing,
+    :tests,
     :posts,
     :releases,
     :sinks,
@@ -44,31 +121,52 @@ class Metadata
     :team,
     :transforms
 
-  def initialize(hash, docs_root, pages_root)
-    @installation = OpenStruct.new()
-    @log_fields = Field.build_struct(hash["log_fields"] || {})
-    @metric_fields = Field.build_struct(hash["metric_fields"] || {})
-    @options = Option.build_struct(hash.fetch("options"))
+  def initialize(hash, docs_root, guides_root, pages_root)
+    @data_model = DataModel.new(hash.fetch("data_model"))
+    @guides = hash.fetch("guides").to_struct_with_name(constructor: Guides)
+    @installation = Installation.new(hash.fetch("installation"))
+    @options = hash.fetch("options").to_struct_with_name(constructor: Field)
     @releases = OpenStruct.new()
     @sinks = OpenStruct.new()
     @sources = OpenStruct.new()
     @transforms = OpenStruct.new()
-    @testing = Option.build_struct(hash.fetch("testing"))
+    @tests = Field.new(hash.fetch("tests").merge({"name" => "tests"}))
 
-    # installation
+    # domains
 
-    installation_hash = hash.fetch("installation")
-    @installation.containers = installation_hash.fetch("containers").collect { |h| OpenStruct.new(h) }
-    @installation.downloads = installation_hash.fetch("downloads").collect { |h| OpenStruct.new(h) }
-    @installation.operating_systems = installation_hash.fetch("operating_systems").collect { |h| OpenStruct.new(h) }
-    @installation.package_managers = installation_hash.fetch("package_managers").collect { |h| OpenStruct.new(h) }
+    @domains = hash.fetch("domains").collect { |h| OpenStruct.new(h) }
+
+    # highlights
+
+    @highlights ||=
+      Dir.
+        glob("#{HIGHLIGHTS_ROOT}/**/*.md").
+        filter do |path|
+          content = File.read(path)
+          content.start_with?("---\n")
+        end.
+        collect do |path|
+          Highlight.new(path)
+        end.
+        sort_by do |highlight|
+          [ highlight.date, highlight.id ]
+        end
 
     # posts
 
     @posts ||=
-      Dir.glob("#{POSTS_ROOT}/**/*.md").collect do |path|
-        Post.new(path)
-      end.sort
+      Dir.
+        glob("#{POSTS_ROOT}/**/*.md").
+        filter do |path|
+          content = File.read(path)
+          content.start_with?("---\n")
+        end.
+        collect do |path|
+          Post.new(path)
+        end.
+        sort_by do |post|
+          [ post.date, post.id ]
+        end
 
     # releases
 
@@ -86,10 +184,8 @@ class Metadata
           sort.
           last
 
-      last_date = last_version && hash.fetch("releases").fetch(last_version.to_s).fetch("date").to_date
-
       release_hash["version"] = version_string
-      release = Release.new(release_hash, last_version, last_date, @posts)
+      release = Release.new(release_hash, last_version, @highlights)
       @releases.send("#{version_string}=", release)
     end
 
@@ -117,6 +213,12 @@ class Metadata
       sink_hash["name"] = sink_name
       sink_hash["posts"] = posts.select { |post| post.sink?(sink_name) }
 
+      (sink_hash["service_providers"] || []).each do |service_provider|
+        provider_hash = (hash["service_providers"] || {})[service_provider.downcase] || {}
+        sink_hash["env_vars"] = (sink_hash["env_vars"] || {}).merge((provider_hash["env_vars"] || {}).clone)
+        sink_hash["options"] = sink_hash["options"].merge((provider_hash["options"] || {}).clone)
+      end
+
       sink =
         case sink_hash.fetch("egress_method")
         when "batching"
@@ -132,15 +234,15 @@ class Metadata
 
     # links
 
-    @links = Links.new(hash.fetch("links"), docs_root, pages_root)
+    @links = Links.new(hash.fetch("links"), docs_root, guides_root, pages_root)
 
     # env vars
 
-    @env_vars = Option.build_struct(hash["env_vars"] || {})
+    @env_vars = (hash["env_vars"] || {}).to_struct_with_name(constructor: Field)
 
     components.each do |component|
       component.env_vars.to_h.each do |key, val|
-        @env_vars.send("#{key}=", val)
+        @env_vars["#{key}"] = val
       end
     end
 
@@ -156,17 +258,12 @@ class Metadata
     @components ||= sources_list + transforms_list + sinks_list
   end
 
-  def downloads(arch: nil, os: nil, package_manager: nil, type: nil)
-    downloads = installation.downloads
-    downloads = downloads.select { |d| d.arch && d.arch.downcase == arch.to_s.downcase } if arch
-    downloads = downloads.select { |d| d.os && d.os.downcase == os.to_s.downcase } if os
-    downloads = downloads.select { |d| d.package_manager && d.package_manager.downcase == package_manager.to_s.downcase } if package_manager
-    downloads = downloads.select { |d| d.type && d.type.downcase == type.to_s.downcase } if type
-    downloads
-  end
-
   def env_vars_list
     @env_vars_list ||= env_vars.to_h.values.sort
+  end
+
+  def event_types
+    @event_types ||= data_model.types
   end
 
   def latest_patch_releases
@@ -185,14 +282,6 @@ class Metadata
     @latest_version ||= latest_release.version
   end
 
-  def log_fields_list
-    @log_fields_list ||= log_fields.to_h.values.sort
-  end
-
-  def metric_fields_list
-    @metric_fields_list ||= metric_fields.to_h.values.sort
-  end
-
   def newer_releases(release)
     releases_list.select do |other_release|
       other_release > release
@@ -205,7 +294,7 @@ class Metadata
     @new_post ||=
       begin
         last_post = posts.last
-        
+
         if (Date.today - last_post.date) <= 30
           last_post
         else
@@ -220,7 +309,7 @@ class Metadata
     @new_post ||=
       begin
         last_release = releases.releases_list.last
-        
+
         if (Date.today - last_release.date) <= 30
           last_release
         else
@@ -233,10 +322,16 @@ class Metadata
     @post_tags ||= posts.collect(&:tags).flatten.uniq
   end
 
-  def platforms
-    @platforms ||= installation.containers +
-      installation.operating_systems +
-      installation.package_managers
+  def platform_names
+    @platforms ||=
+      begin
+        (
+          installation.operating_systems_list.collect(&:name) +
+          installation.package_managers_list.collect(&:name) +
+          installation.package_managers_list.collect(&:archs).flatten.uniq +
+          installation.platforms_list.collect(&:name)
+        ).sort
+      end
   end
 
   def previous_minor_releases(release)
@@ -255,6 +350,10 @@ class Metadata
     releases
   end
 
+  def service_providers
+    @service_providers ||= components.collect(&:service_providers).flatten.uniq
+  end
+
   def sinks_list
     @sinks_list ||= sinks.to_h.values.sort
   end
@@ -265,9 +364,13 @@ class Metadata
 
   def to_h
     {
+      event_types: event_types,
+      guides: guides.deep_to_h,
       installation: installation.deep_to_h,
+      latest_highlight: highlights.last.deep_to_h,
       latest_post: posts.last.deep_to_h,
       latest_release: latest_release.deep_to_h,
+      highlights: highlights.deep_to_h,
       posts: posts.deep_to_h,
       post_tags: post_tags,
       releases: releases.deep_to_h,

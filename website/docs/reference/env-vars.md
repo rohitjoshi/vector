@@ -1,8 +1,13 @@
 ---
+last_modified_on: "2020-05-01"
 title: Environment Variables
+description: "A full list of Vector's supported environment variables and how to use them."
 sidebar_label: Env Vars
-description: Vector's environment variables
 ---
+
+import Alert from '@site/src/components/Alert';
+import Fields from '@site/src/components/Fields';
+import Field from '@site/src/components/Field';
 
 You can control Vector's behavior through select environment variables:
 
@@ -10,7 +15,7 @@ You can control Vector's behavior through select environment variables:
 ENV_VAR1=val ENV_VAR2=val vector --config=/etc/vector/vector.toml
 ```
 
-In addition, we recommend that you look at the [global configuration 
+In addition, we recommend that you look at the [global configuration
 options][docs.global-options] as well.
 
 <!--
@@ -21,28 +26,71 @@ options][docs.global-options] as well.
      website/docs/reference/env-vars.md.erb
 -->
 
-## Variables
-
-import Fields from '@site/src/components/Fields';
-
-import Field from '@site/src/components/Field';
+## Special Variables
 
 <Fields filters={true}>
-
-
 <Field
   common={false}
-  defaultValue={"unix:///var/run/docker.sock"}
+  defaultValue={null}
   enumValues={null}
-  examples={["unix://path/to/socket","tcp://host:2375/path"]}
-  name={"DOCKER_HOST"}
-  nullable={false}
+  examples={["AKIAIOSFODNN7EXAMPLE"]}
+  groups={[]}
+  name={"AWS_ACCESS_KEY_ID"}
   path={null}
   relevantWhen={null}
   required={false}
   templateable={false}
   type={"string"}
   unit={null}
+  warnings={[]}
+  >
+
+### AWS_ACCESS_KEY_ID
+
+Used for AWS authentication when communicating with AWS services. See relevant
+[AWS components][pages.aws_components] for more info.
+
+
+
+</Field>
+<Field
+  common={false}
+  defaultValue={null}
+  enumValues={null}
+  examples={["wJalrXUtnFEMI/K7MDENG/FD2F4GJ"]}
+  groups={[]}
+  name={"AWS_SECRET_ACCESS_KEY"}
+  path={null}
+  relevantWhen={null}
+  required={false}
+  templateable={false}
+  type={"string"}
+  unit={null}
+  warnings={[]}
+  >
+
+### AWS_SECRET_ACCESS_KEY
+
+Used for AWS authentication when communicating with AWS services. See relevant
+[AWS components][pages.aws_components] for more info.
+
+
+
+</Field>
+<Field
+  common={false}
+  defaultValue={"unix:///var/run/docker.sock"}
+  enumValues={null}
+  examples={["unix://path/to/socket","tcp://host:2375/path"]}
+  groups={[]}
+  name={"DOCKER_HOST"}
+  path={null}
+  relevantWhen={null}
+  required={false}
+  templateable={false}
+  type={"string"}
+  unit={null}
+  warnings={[]}
   >
 
 ### DOCKER_HOST
@@ -50,80 +98,142 @@ import Field from '@site/src/components/Field';
 The docker host to connect to.
 
 
+
 </Field>
-
-
 <Field
   common={false}
   defaultValue={true}
   enumValues={null}
   examples={[true,false]}
+  groups={[]}
   name={"DOCKER_VERIFY_TLS"}
-  nullable={false}
   path={null}
   relevantWhen={null}
   required={false}
   templateable={false}
   type={"bool"}
   unit={null}
+  warnings={[]}
   >
 
 ### DOCKER_VERIFY_TLS
 
-If `true` (the default), Vector will validate the TLS certificate of the remote host. Do NOT set this to `false` unless you understand the risks of not verifying the remote certificate.
+If `true` (the default), Vector will validate the TLS certificate of the remote
+host. Do NOT set this to `false` unless you understand the risks of not
+verifying the remote certificate.
+
 
 
 </Field>
-
-
 <Field
   common={true}
   defaultValue={null}
   enumValues={null}
-  examples={["debug"]}
-  name={"LOG"}
-  nullable={false}
+  examples={["/path/to/credentials.json"]}
+  groups={[]}
+  name={"GOOGLE_APPLICATION_CREDENTIALS"}
   path={null}
   relevantWhen={null}
-  required={true}
+  required={false}
   templateable={false}
   type={"string"}
   unit={null}
+  warnings={[]}
+  >
+
+### GOOGLE_APPLICATION_CREDENTIALS
+
+The filename for a Google Cloud service account credentials JSON file used to
+authenticate access to the Stackdriver Logging API.
+
+
+
+</Field>
+<Field
+  common={false}
+  defaultValue={null}
+  enumValues={null}
+  examples={["debug"]}
+  groups={[]}
+  name={"LOG"}
+  path={null}
+  relevantWhen={null}
+  required={false}
+  templateable={false}
+  type={"string"}
+  unit={null}
+  warnings={[]}
   >
 
 ### LOG
 
-Sets Vector's log level. See the [log section in the monitoring guide][docs.monitoring#level] for more information on the available levels.
+Sets Vector's log level. See the [log section in the monitoring
+guide][docs.monitoring#levels] for more information on the available levels.
+
 
 
 </Field>
-
-
 <Field
-  common={true}
+  common={false}
   defaultValue={null}
   enumValues={null}
   examples={[true,false]}
+  groups={[]}
   name={"RUST_BACKTRACE"}
-  nullable={false}
   path={null}
   relevantWhen={null}
-  required={true}
+  required={false}
   templateable={false}
   type={"bool"}
   unit={null}
+  warnings={[]}
   >
 
 ### RUST_BACKTRACE
 
-Enables backtraces when errors are logged. Use this when debugging only since it can degrade performance.
+Enables backtraces when errors are logged. Use this when debugging only since
+it can degrade performance.
+
 
 
 </Field>
-
-
 </Fields>
 
+## Custom Variables
 
+As noticed in the [configuration document][docs.configuration#environment-variables],
+Vector supports custom environment variables via the `${...}` syntax:
+
+```toml
+option = "${ENV_VAR}"
+```
+
+<Alert type="info">
+
+Interpolation is done before parsing the configuration file. This is done when
+[starting][docs.process-management#starting] and
+[reloading][docs.process-management#reloading] Vector.
+
+</Alert>
+
+### Default Values
+
+Default values can be supplied via the `:-` syntax:
+
+```toml
+option = "${ENV_VAR:-default}"
+```
+
+### Escaping
+
+You can escape environment variable by preceding them with a `$` character. For
+example `$${HOSTNAME}` will be treated _literally_ in the above environment
+variable example.
+
+
+[docs.configuration#environment-variables]: /docs/setup/configuration/#environment-variables
 [docs.global-options]: /docs/reference/global-options/
-[docs.monitoring#level]: /docs/administration/monitoring/#level
+[docs.monitoring#levels]: /docs/administration/monitoring/#levels
+[docs.process-management#reloading]: /docs/administration/process-management/#reloading
+[docs.process-management#starting]: /docs/administration/process-management/#starting
+[pages.aws_components]: /components/?providers%5B%5D=aws/

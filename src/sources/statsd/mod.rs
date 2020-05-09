@@ -1,9 +1,9 @@
-use crate::{topology::config::GlobalOptions, Event};
-use futures::{future, sync::mpsc, Future, Sink, Stream};
+use crate::{shutdown::ShutdownSignal, stream::StreamExt, topology::config::GlobalOptions, Event};
+use futures01::{future, sync::mpsc, Future, Sink, Stream};
 use parser::parse;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use tokio::{
+use tokio01::{
     self,
     codec::BytesCodec,
     net::{UdpFramed, UdpSocket},
@@ -23,9 +23,10 @@ impl crate::topology::config::SourceConfig for StatsdConfig {
         &self,
         _name: &str,
         _globals: &GlobalOptions,
+        shutdown: ShutdownSignal,
         out: mpsc::Sender<Event>,
     ) -> crate::Result<super::Source> {
-        Ok(statsd(self.address, out))
+        Ok(statsd(self.address, shutdown, out))
     }
 
     fn output_type(&self) -> crate::topology::config::DataType {
@@ -37,7 +38,7 @@ impl crate::topology::config::SourceConfig for StatsdConfig {
     }
 }
 
-fn statsd(addr: SocketAddr, out: mpsc::Sender<Event>) -> super::Source {
+fn statsd(addr: SocketAddr, shutdown: ShutdownSignal, out: mpsc::Sender<Event>) -> super::Source {
     let out = out.sink_map_err(|e| error!("error sending metric: {:?}", e));
 
     Box::new(
@@ -52,8 +53,9 @@ fn statsd(addr: SocketAddr, out: mpsc::Sender<Event>) -> super::Source {
 
             future::ok(socket)
         })
-        .and_then(|socket| {
+        .and_then(move |socket| {
             let metrics_in = UdpFramed::new(socket, BytesCodec::new())
+                .take_until(shutdown)
                 .map(|(bytes, _sock)| {
                     let packet = String::from_utf8_lossy(bytes.as_ref());
                     let metrics = packet
@@ -62,7 +64,7 @@ fn statsd(addr: SocketAddr, out: mpsc::Sender<Event>) -> super::Source {
                         .filter_map(|res| res.map_err(|e| error!("{}", e)).ok())
                         .map(Event::Metric)
                         .collect::<Vec<_>>();
-                    futures::stream::iter_ok::<_, std::io::Error>(metrics)
+                    futures01::stream::iter_ok::<_, std::io::Error>(metrics)
                 })
                 .flatten()
                 .map_err(|e| error!("error reading datagram: {:?}", e));
@@ -72,6 +74,7 @@ fn statsd(addr: SocketAddr, out: mpsc::Sender<Event>) -> super::Source {
     )
 }
 
+#[cfg(feature = "sinks-prometheus")]
 #[cfg(test)]
 mod test {
     use super::StatsdConfig;
@@ -80,7 +83,7 @@ mod test {
         test_util::{block_on, next_addr, runtime, shutdown_on_idle},
         topology::{self, config},
     };
-    use futures::Stream;
+    use futures01::Stream;
     use std::{thread, time::Duration};
 
     fn parse_count(lines: &Vec<&str>, prefix: &str) -> usize {
@@ -107,7 +110,7 @@ mod test {
                 address: out_addr,
                 namespace: "vector".into(),
                 buckets: vec![1.0, 2.0, 4.0],
-                flush_period: Duration::from_millis(1000),
+                flush_period_secs: 1,
             },
         );
 

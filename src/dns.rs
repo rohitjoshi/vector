@@ -1,12 +1,16 @@
 use crate::runtime::TaskExecutor;
-use futures::{future, Future};
+use futures::{compat::Future01CompatExt, future::BoxFuture, FutureExt};
+use futures01::{future, Future};
 use hyper::client::connect::dns::{Name, Resolve};
-use snafu::{futures01::FutureExt, ResultExt};
+use hyper13::client::connect::dns::Name as Name13;
+use snafu::{futures01::FutureExt as _, ResultExt};
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
+    task::{Context, Poll},
 };
+use tower03::Service;
 use trust_dns_resolver::{
     config::{LookupIpStrategy, NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     lookup_ip::LookupIpIntoIter,
@@ -66,7 +70,11 @@ impl Resolver {
 
             (config, opts)
         } else {
-            system_conf::read_system_conf().context(ReadSystemConf)?
+            #[cfg(feature = "disable-resolv-conf")]
+            let res = (Default::default(), Default::default());
+            #[cfg(not(feature = "disable-resolv-conf"))]
+            let res = system_conf::read_system_conf().context(ReadSystemConf)?;
+            res
         };
 
         let (inner, bg_task) = AsyncResolver::new(config, opt);
@@ -111,6 +119,23 @@ impl Resolve for Resolver {
             io::Error::new(io::ErrorKind::Other, e)
         });
         Box::new(fut)
+    }
+}
+
+impl Service<Name13> for Resolver {
+    type Response = LookupIp;
+    type Error = std::io::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Ok(()).into()
+    }
+
+    fn call(&mut self, name: Name13) -> Self::Future {
+        self.lookup_ip(name.as_str())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .compat()
+            .boxed()
     }
 }
 
@@ -184,7 +209,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::{IpAddr, SocketAddr, UdpSocket};
     use std::str::FromStr;
-    use tokio::prelude::{future::poll_fn, Async};
+    use tokio01::prelude::{future::poll_fn, Async};
     use trust_dns::rr::{record_data::RData, LowerName, Name, RecordSet, RecordType, RrKey};
     use trust_dns_proto::rr::rdata::soa::SOA;
     use trust_dns_server::{

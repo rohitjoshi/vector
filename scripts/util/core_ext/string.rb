@@ -1,6 +1,10 @@
 require 'word_wrap/core_ext'
 
 class String
+  def capitalize_first
+    self[0].capitalize + self[1..-1]
+  end
+
   # Comments out a block of text
   def commentify
     "# " + self.gsub("\n", "\n# ")
@@ -9,7 +13,7 @@ class String
   # Downcases the first letter, even if it has markdown syntax
   def continuize
     i = 0
-    
+
     loop do
       if i > self.length
         break

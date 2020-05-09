@@ -40,11 +40,11 @@ end
 # Commit
 #
 
-metadata = Metadata.load!(META_ROOT, DOCS_ROOT, PAGES_ROOT)
+metadata = Metadata.load!(META_ROOT, DOCS_ROOT, GUIDES_ROOT, PAGES_ROOT)
 release = metadata.latest_release
 
 if release_exists?(release)
-  error!(
+  Printer.error!(
     <<~EOF
     It looks like release v#{release.version} has already been released. A tag for this release already exists.
 
@@ -52,23 +52,20 @@ if release_exists?(release)
     EOF
   )
 else
-  title("Committing and tagging release")
+  Printer.title("Committing and tagging release")
 
   bump_cargo_version(release.version)
 
-  success("Bumped the version in Cargo.toml & Cargo.lock to #{release.version}")
-  
+  Printer.success("Bumped the version in Cargo.toml & Cargo.lock to #{release.version}")
+
   branch_name = "#{release.version.major}.#{release.version.minor}"
 
   commands =
     <<~EOF
-    git add . -A
+    git add #{ROOT_DIR} -A
     git commit -sam 'chore: Prepare v#{release.version} release'
-    git push origin master
     git tag -a v#{release.version} -m "v#{release.version}"
-    git push origin v#{release.version}
-    git branch v#{branch_name}
-    git push origin v#{branch_name}
+    git branch v#{branch_name} 2>/dev/null || true
     EOF
 
   commands.chomp!
@@ -96,7 +93,7 @@ else
     system(command)
 
     if !$?.success?
-      error!(
+      Printer.error!(
         <<~EOF
         Command failed!
 

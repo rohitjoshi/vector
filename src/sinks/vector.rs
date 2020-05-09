@@ -1,29 +1,36 @@
 use crate::{
-    buffers::Acker,
     event::proto,
-    sinks::tcp::TcpSink,
-    sinks::util::SinkExt,
+    internal_events::VectorEventSent,
+    sinks::util::{tcp::TcpSink, StreamSink},
+    tls::{MaybeTlsSettings, TlsConfig},
     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
     Event,
 };
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{future, Future, Sink};
+use futures01::{stream::iter_ok, Sink};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
-use std::net::{SocketAddr, ToSocketAddrs};
-use tokio::net::TcpStream;
+use snafu::Snafu;
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct VectorSinkConfig {
     pub address: String,
+    pub tls: Option<TlsConfig>,
 }
 
 impl VectorSinkConfig {
     pub fn new(address: String) -> Self {
-        Self { address }
+        Self { address, tls: None }
     }
+}
+
+#[derive(Debug, Snafu)]
+enum BuildError {
+    #[snafu(display("Missing host in address field"))]
+    MissingHost,
+    #[snafu(display("Missing port in address field"))]
+    MissingPort,
 }
 
 inventory::submit! {
@@ -33,36 +40,28 @@ inventory::submit! {
 #[typetag::serde(name = "vector")]
 impl SinkConfig for VectorSinkConfig {
     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
-        let addr = self
-            .address
-            .to_socket_addrs()
-            .context(super::SocketAddressError)?
-            .next()
-            .ok_or(Box::new(super::BuildError::DNSFailure {
-                address: self.address.clone(),
-            }))?;
+        let uri = self.address.parse::<http::Uri>()?;
 
-        let sink = vector(self.address.clone(), addr, cx.acker());
-        let healthcheck = super::tcp::tcp_healthcheck(addr);
+        let host = uri.host().ok_or(BuildError::MissingHost)?.to_string();
+        let port = uri.port_u16().ok_or(BuildError::MissingPort)?;
 
-        Ok((sink, healthcheck))
+        let tls = MaybeTlsSettings::from_config(&self.tls, false)?;
+
+        let sink = TcpSink::new(host.clone(), port, cx.resolver(), tls);
+        let sink = StreamSink::new(sink, cx.acker())
+            .with_flat_map(move |event| iter_ok(encode_event(event)));
+        let healthcheck = super::util::tcp::tcp_healthcheck(host, port, cx.resolver());
+
+        Ok((Box::new(sink), healthcheck))
     }
 
     fn input_type(&self) -> DataType {
-        DataType::Log
+        DataType::Any
     }
 
     fn sink_type(&self) -> &'static str {
         "vector"
     }
-}
-
-pub fn vector(hostname: String, addr: SocketAddr, acker: Acker) -> super::RouterSink {
-    Box::new(
-        TcpSink::new(hostname, addr, None)
-            .stream_ack(acker)
-            .with(encode_event),
-    )
 }
 
 #[derive(Debug, Snafu)]
@@ -71,24 +70,17 @@ enum HealthcheckError {
     ConnectError { source: std::io::Error },
 }
 
-pub fn vector_healthcheck(addr: SocketAddr) -> super::Healthcheck {
-    // Lazy to avoid immediately connecting
-    let check = future::lazy(move || {
-        TcpStream::connect(&addr)
-            .map(|_| ())
-            .map_err(|err| err.into())
-    });
-
-    Box::new(check)
-}
-
-fn encode_event(event: Event) -> Result<Bytes, ()> {
+fn encode_event(event: Event) -> Option<Bytes> {
     let event = proto::EventWrapper::from(event);
-    let event_len = event.encoded_len() as u32;
+    let event_len = event.encoded_len();
     let full_len = event_len + 4;
 
-    let mut out = BytesMut::with_capacity(full_len as usize);
-    out.put_u32_be(event_len);
+    emit!(VectorEventSent {
+        byte_size: full_len
+    });
+
+    let mut out = BytesMut::with_capacity(full_len);
+    out.put_u32_be(event_len as u32);
     event.encode(&mut out).unwrap();
-    Ok(out.freeze())
+    Some(out.freeze())
 }

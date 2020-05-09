@@ -1,8 +1,10 @@
 ---
+last_modified_on: "2020-04-01"
 title: Concepts
 description: The fundamental Vector concepts. A great place to start learning about Vector.
 ---
 
+import Jump from '@site/src/components/Jump';
 import SVG from 'react-inlinesvg';
 
 <SVG src="/img/concepts.svg" />
@@ -25,19 +27,17 @@ proceed and is also cool to brag about amongst friends.
 [transforms](#transforms), and [sinks](#sinks). You compose components to create
 pipelines, allowing you to ingest, transform, and send data.
 
-import Jump from '@site/src/components/Jump';
-
 <Jump to="/components/">View all components</Jump>
 
 ### Sources
 
-Vector would be junk if it couldn't injest data. A "source" defines where Vector
+Vector would be junk if it couldn't ingest data. A "source" defines where Vector
 should pull data from, or how it should receive data pushed to it. A pipeline
 can have any number of sources, and as they ingest data they proceed to
 normalize it into [events](#events) \(see next section\). This sets the stage
 for easy and consistent processing of your data. Examples of sources include
 [`file`][docs.sources.file], [`syslog`][docs.sources.syslog],
-[`tcp`][docs.sources.tcp], and [`stdin`][docs.sources.stdin].
+[`socket`][docs.sources.socket], and [`stdin`][docs.sources.stdin].
 
 <Jump to="/docs/reference/sources/">View all sources</Jump>
 
@@ -52,11 +52,11 @@ to you.
 
 ### Sinks
 
-A "sink" is a destination for [events][docs.data_model#event]. Each sink's
+A "sink" is a destination for [events][docs.data-model]. Each sink's
 design and transmission method is dictated by the downstream service it is
-interacting with. For example, the [`tcp` sink][docs.sinks.tcp] will stream
-individual events, while the [`aws_s3` sink][docs.sinks.aws_s3] will buffer and
-flush data.
+interacting with. For example, the [`socket` sink][docs.sinks.socket] will
+stream individual events, while the [`aws_s3` sink][docs.sinks.aws_s3] will
+buffer and flush data.
 
 <Jump to="/docs/reference/sinks/">View all sinks</Jump>
 
@@ -79,10 +79,9 @@ pipeline in the [configuration section][docs.configuration].
 
 [docs.configuration]: /docs/setup/configuration/
 [docs.data-model]: /docs/about/data-model/
-[docs.data_model#event]: /docs/about/data-model/#event
 [docs.sinks.aws_s3]: /docs/reference/sinks/aws_s3/
-[docs.sinks.tcp]: /docs/reference/sinks/tcp/
+[docs.sinks.socket]: /docs/reference/sinks/socket/
 [docs.sources.file]: /docs/reference/sources/file/
+[docs.sources.socket]: /docs/reference/sources/socket/
 [docs.sources.stdin]: /docs/reference/sources/stdin/
 [docs.sources.syslog]: /docs/reference/sources/syslog/
-[docs.sources.tcp]: /docs/reference/sources/tcp/

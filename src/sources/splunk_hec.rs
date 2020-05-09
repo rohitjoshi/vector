@@ -1,22 +1,22 @@
 use crate::{
-    event::{self, flatten::flatten, Event, LogEvent, ValueKind},
+    event::{self, Event, LogEvent, Value},
+    shutdown::ShutdownSignal,
+    tls::{MaybeTlsSettings, TlsConfig},
     topology::config::{DataType, GlobalOptions, SourceConfig},
 };
 use bytes::{Buf, Bytes};
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use flate2::read::GzDecoder;
-use futures::{sync::mpsc, Async, Future, Sink, Stream};
+use futures01::{sync::mpsc, Async, Future, Sink, Stream};
 use hyper::{Body, Response, StatusCode};
 use lazy_static::lazy_static;
 use serde::{de, Deserialize, Serialize};
-use serde_json::{de::IoRead, json, Deserializer, Value};
+use serde_json::{de::IoRead, json, Deserializer, Value as JsonValue};
 use snafu::Snafu;
-use std::sync::{Arc, Mutex};
 use std::{
     io::Read,
     net::{Ipv4Addr, SocketAddr},
 };
-use stream_cancel::{Trigger, Tripwire};
 use string_cache::DefaultAtom as Atom;
 use warp::{body::FullBody, filters::BoxedFilter, path, Filter, Rejection, Reply};
 
@@ -30,12 +30,34 @@ lazy_static! {
 
 /// Accepts HTTP requests.
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields, default)]
 pub struct SplunkConfig {
     /// Local address on which to listen
     #[serde(default = "default_socket_address")]
     address: SocketAddr,
     /// Splunk HEC token
-    token: String,
+    token: Option<String>,
+    tls: Option<TlsConfig>,
+}
+
+impl SplunkConfig {
+    #[cfg(test)]
+    pub fn on(address: SocketAddr) -> Self {
+        SplunkConfig {
+            address,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for SplunkConfig {
+    fn default() -> Self {
+        SplunkConfig {
+            address: default_socket_address(),
+            token: None,
+            tls: None,
+        }
+    }
 }
 
 fn default_socket_address() -> SocketAddr {
@@ -48,15 +70,14 @@ impl SourceConfig for SplunkConfig {
         &self,
         _: &str,
         _: &GlobalOptions,
+        shutdown: ShutdownSignal,
         out: mpsc::Sender<Event>,
     ) -> crate::Result<super::Source> {
-        let (trigger, tripwire) = Tripwire::new();
+        let source = SplunkSource::new(self);
 
-        let source = Arc::new(SplunkSource::new(self, out, trigger));
-
-        let event_service = SplunkSource::event_service(source.clone());
-        let raw_service = SplunkSource::raw_service(source.clone());
-        let health_service = SplunkSource::health_service(source);
+        let event_service = source.event_service(out.clone());
+        let raw_service = source.raw_service(out.clone());
+        let health_service = source.health_service(out.clone());
         let options = SplunkSource::options();
 
         let services = path!("services" / "collector")
@@ -71,10 +92,14 @@ impl SourceConfig for SplunkConfig {
             )
             .or_else(finish_err);
 
-        // Build server
-        let (_, server) = warp::serve(services).bind_with_graceful_shutdown(self.address, tripwire);
+        let tls = MaybeTlsSettings::from_config(&self.tls, true)?;
+        let incoming = tls.bind(&self.address)?.incoming();
 
-        Ok(Box::new(server))
+        let server = warp::serve(services)
+            .serve_incoming_with_graceful_shutdown(incoming, shutdown.clone().map(|_| ()));
+
+        // We should drop the last copy of ShutdownSignalToken only after the server has shut down.
+        Ok(Box::new(server.map(move |()| drop(shutdown))))
     }
 
     fn output_type(&self) -> DataType {
@@ -88,34 +113,30 @@ impl SourceConfig for SplunkConfig {
 
 /// Shared data for responding to requests.
 struct SplunkSource {
-    /// Source output
-    out: mpsc::Sender<Event>,
-    /// Trigger for ending http server
-    trigger: Arc<Mutex<Option<Trigger>>>,
-
-    credentials: Bytes,
+    credentials: Option<Bytes>,
 }
 
 impl SplunkSource {
-    fn new(config: &SplunkConfig, out: mpsc::Sender<Event>, trigger: Trigger) -> Self {
+    fn new(config: &SplunkConfig) -> Self {
         SplunkSource {
-            credentials: format!("Splunk {}", config.token).into(),
-            out,
-            trigger: Arc::new(Mutex::new(Some(trigger))),
+            credentials: config
+                .token
+                .as_ref()
+                .map(|token| format!("Splunk {}", token).into()),
         }
     }
 
-    fn event_service(source: Arc<Self>) -> BoxedFilter<(Response<Body>,)> {
+    fn event_service(&self, out: mpsc::Sender<Event>) -> BoxedFilter<(Response<Body>,)> {
         warp::post2()
             .and(
                 warp::path::end()
                     .or(path!("event").and(warp::path::end()))
                     .or(path!("event" / "1.0").and(warp::path::end())),
             )
-            .and(source.authorization())
+            .and(self.authorization())
             .and(warp::header::optional::<String>("x-splunk-request-channel"))
             .and(warp::header::optional::<String>("host"))
-            .and(source.gzip())
+            .and(self.gzip())
             .and(warp::body::concat())
             .and_then(
                 move |_,
@@ -128,14 +149,14 @@ impl SplunkSource {
                     if gzip {
                         Box::new(
                             EventStream::new(GzDecoder::new(body.reader()), channel, host)
-                                .forward(source.sink_with_shutdown())
+                                .forward(out.clone().sink_map_err(|_| ApiError::ServerShutdown))
                                 .map(|_| ()),
                         )
                             as Box<dyn Future<Item = (), Error = Rejection> + Send>
                     } else {
                         Box::new(
                             EventStream::new(body.reader(), channel, host)
-                                .forward(source.sink_with_shutdown())
+                                .forward(out.clone().sink_map_err(|_| ApiError::ServerShutdown))
                                 .map(|_| ()),
                         )
                             as Box<dyn Future<Item = (), Error = Rejection> + Send>
@@ -146,13 +167,13 @@ impl SplunkSource {
             .boxed()
     }
 
-    fn raw_service(source: Arc<Self>) -> BoxedFilter<(Response<Body>,)> {
+    fn raw_service(&self, out: mpsc::Sender<Event>) -> BoxedFilter<(Response<Body>,)> {
         warp::post2()
             .and(
                 (path!("raw" / "1.0").and(warp::path::end()))
                     .or(path!("raw").and(warp::path::end())),
             )
-            .and(source.authorization())
+            .and(self.authorization())
             .and(
                 warp::header::optional::<String>("x-splunk-request-channel").and_then(
                     |channel: Option<String>| {
@@ -165,13 +186,13 @@ impl SplunkSource {
                 ),
             )
             .and(warp::header::optional::<String>("host"))
-            .and(source.gzip())
+            .and(self.gzip())
             .and(warp::body::concat())
             .and_then(
                 move |_, _, channel: String, host: Option<String>, gzip: bool, body: FullBody| {
                     // Construct event parser
-                    futures::stream::once(raw_event(body, gzip, channel, host))
-                        .forward(source.sink_with_shutdown())
+                    futures01::stream::once(raw_event(body, gzip, channel, host))
+                        .forward(out.clone().sink_map_err(|_| ApiError::ServerShutdown))
                         .map(|_| ())
                 },
             )
@@ -179,12 +200,15 @@ impl SplunkSource {
             .boxed()
     }
 
-    fn health_service(source: Arc<Self>) -> BoxedFilter<(Response<Body>,)> {
-        let credentials = source.credentials.clone();
+    fn health_service(&self, out: mpsc::Sender<Event>) -> BoxedFilter<(Response<Body>,)> {
+        let credentials = self.credentials.clone();
         let authorize =
             warp::header::optional("Authorization").and_then(move |token: Option<String>| {
-                match token {
-                    Some(token) if token.as_bytes() == credentials => Ok(()),
+                match (token, credentials.as_ref()) {
+                    (_, None) => Ok(()),
+                    (Some(token), Some(password)) if token.as_bytes() == password.as_ref() => {
+                        Ok(())
+                    }
                     _ => Err(Rejection::from(ApiError::BadRequest)),
                 }
             });
@@ -196,7 +220,7 @@ impl SplunkSource {
             )
             .and(authorize)
             .and_then(move |_, _| {
-                match source.out.clone().poll_ready() {
+                match out.clone().poll_ready() {
                     Ok(Async::Ready(())) => Ok(warp::reply().into_response()),
                     // Since channel of mpsc::Sender increase by one with each sender, technically
                     // channel will never be full, and this will never be returned.
@@ -237,11 +261,16 @@ impl SplunkSource {
     fn authorization(&self) -> BoxedFilter<((),)> {
         let credentials = self.credentials.clone();
         warp::header::optional("Authorization")
-            .and_then(move |token: Option<String>| match token {
-                Some(token) if token.as_bytes() == credentials => Ok(()),
-                Some(_) => Err(Rejection::from(ApiError::InvalidAuthorization)),
-                None => Err(Rejection::from(ApiError::MissingAuthorization)),
-            })
+            .and_then(
+                move |token: Option<String>| match (token, credentials.as_ref()) {
+                    (_, None) => Ok(()),
+                    (Some(token), Some(password)) if token.as_bytes() == password.as_ref() => {
+                        Ok(())
+                    }
+                    (Some(_), Some(_)) => Err(Rejection::from(ApiError::InvalidAuthorization)),
+                    (None, Some(_)) => Err(Rejection::from(ApiError::MissingAuthorization)),
+                },
+            )
             .boxed()
     }
 
@@ -255,24 +284,6 @@ impl SplunkSource {
             })
             .boxed()
     }
-
-    /// Sink shutdowns this source once source output is closed
-    fn sink_with_shutdown(&self) -> impl Sink<SinkItem = Event, SinkError = Rejection> + 'static {
-        let trigger = self.trigger.clone();
-        self.out.clone().sink_map_err(move |_| {
-            // Sink has been closed so server should stop listening
-            trigger
-                .try_lock()
-                .map(|mut lock| {
-                    // Stopping
-                    lock.take();
-                })
-                // If locking fails, that means someone else is stopping it.
-                .ok();
-
-            ApiError::ServerShutdown.into()
-        })
-    }
 }
 
 /// Constructs one ore more events from json-s coming from reader.
@@ -283,9 +294,9 @@ struct EventStream<R: Read> {
     /// Count of sended events
     events: usize,
     /// Optinal channel from headers
-    channel: Option<ValueKind>,
-    /// Extracted default time
-    time: Option<ValueKind>,
+    channel: Option<Value>,
+    /// Default time
+    time: Time,
     /// Remaining extracted default values
     extractors: [DefaultExtractor; 4],
 }
@@ -296,11 +307,11 @@ impl<R: Read> EventStream<R> {
             data,
             events: 0,
             channel: channel.map(|value| value.as_bytes().into()),
-            time: None,
+            time: Time::Now(Utc::now()),
             extractors: [
                 DefaultExtractor::new_with(
                     "host",
-                    &event::HOST,
+                    &event::log_schema().host_key(),
                     host.map(|value| value.as_bytes().into()),
                 ),
                 DefaultExtractor::new("index", &INDEX),
@@ -332,7 +343,7 @@ impl<R: Read> Stream for EventStream<R> {
     type Error = Rejection;
     fn poll(&mut self) -> Result<Async<Option<Event>>, Rejection> {
         // Parse JSON object
-        let mut json = match self.from_reader_take::<Value>() {
+        let mut json = match self.from_reader_take::<JsonValue>() {
             Ok(Some(json)) => json,
             Ok(None) => {
                 return if self.events == 0 {
@@ -351,20 +362,39 @@ impl<R: Read> Stream for EventStream<R> {
         let mut event = Event::new_empty_log();
         let log = event.as_mut_log();
 
+        // Add source type
+        log.insert(event::log_schema().source_type_key(), "splunk_hec");
+
         // Process event field
         match json.get_mut("event") {
             Some(event) => match event.take() {
-                Value::String(string) => {
+                JsonValue::String(string) => {
                     if string.is_empty() {
                         return Err(ApiError::EmptyEventField { event: self.events }.into());
                     }
-                    log.insert_explicit(event::MESSAGE.clone(), string.into())
+                    log.insert(event::log_schema().message_key().clone(), string);
                 }
-                Value::Object(object) => {
+                JsonValue::Object(mut object) => {
                     if object.is_empty() {
                         return Err(ApiError::EmptyEventField { event: self.events }.into());
                     }
-                    flatten(log, object);
+
+                    // Add 'line' value as 'event::schema().message_key'
+                    if let Some(line) = object.remove("line") {
+                        match line {
+                            // This don't quite fit the meaning of a event::schema().message_key
+                            JsonValue::Array(_) | JsonValue::Object(_) => {
+                                log.insert("line", line);
+                            }
+                            _ => {
+                                log.insert(event::log_schema().message_key(), line);
+                            }
+                        }
+                    }
+
+                    for (key, value) in object {
+                        log.insert(key, value);
+                    }
                 }
                 _ => return Err(ApiError::InvalidDataFormat { event: self.events }.into()),
             },
@@ -372,36 +402,38 @@ impl<R: Read> Stream for EventStream<R> {
         }
 
         // Process channel field
-        if let Some(Value::String(guid)) = json.get_mut("channel").map(Value::take) {
-            log.insert_explicit(CHANNEL.clone(), guid.into());
+        if let Some(JsonValue::String(guid)) = json.get_mut("channel").map(JsonValue::take) {
+            log.insert(CHANNEL.clone(), guid);
         } else if let Some(guid) = self.channel.as_ref() {
-            log.insert_explicit(CHANNEL.clone(), guid.clone());
+            log.insert(CHANNEL.clone(), guid.clone());
         }
 
         // Process fields field
-        if let Some(Value::Object(object)) = json.get_mut("fields").map(Value::take) {
-            flatten(log, object);
+        if let Some(JsonValue::Object(object)) = json.get_mut("fields").map(JsonValue::take) {
+            for (key, value) in object {
+                log.insert(key, value);
+            }
         }
 
         // Process time field
-        let parsed_time = match json.get_mut("time").map(Value::take) {
-            Some(Value::Number(time)) => Some(Some(time)),
-            Some(Value::String(time)) => Some(time.parse::<serde_json::Number>().ok()),
+        let parsed_time = match json.get_mut("time").map(JsonValue::take) {
+            Some(JsonValue::Number(time)) => Some(Some(time)),
+            Some(JsonValue::String(time)) => Some(time.parse::<serde_json::Number>().ok()),
             _ => None,
         };
         match parsed_time {
             None => (),
             Some(Some(t)) => {
                 if let Some(t) = t.as_u64() {
-                    self.time = Some(Utc.timestamp(t as i64, 0).into());
+                    let time = parse_timestamp(t as i64)
+                        .ok_or_else(|| ApiError::InvalidDataFormat { event: self.events })?;
+
+                    self.time = Time::Provided(time);
                 } else if let Some(t) = t.as_f64() {
-                    self.time = Some(
-                        Utc.timestamp(
-                            t.floor() as i64,
-                            (t.fract() * 1000.0 * 1000.0 * 1000.0) as u32,
-                        )
-                        .into(),
-                    );
+                    self.time = Time::Provided(Utc.timestamp(
+                        t.floor() as i64,
+                        (t.fract() * 1000.0 * 1000.0 * 1000.0) as u32,
+                    ));
                 } else {
                     return Err(ApiError::InvalidDataFormat { event: self.events }.into());
                 }
@@ -410,9 +442,10 @@ impl<R: Read> Stream for EventStream<R> {
         }
 
         // Add time field
-        if let Some(time) = self.time.as_ref() {
-            log.insert_explicit(event::TIMESTAMP.clone(), time.clone());
-        }
+        match self.time.clone() {
+            Time::Provided(time) => log.insert(event::log_schema().timestamp_key().clone(), time),
+            Time::Now(time) => log.insert(event::log_schema().timestamp_key().clone(), time),
+        };
 
         // Extract default extracted fields
         for de in self.extractors.iter_mut() {
@@ -425,11 +458,43 @@ impl<R: Read> Stream for EventStream<R> {
     }
 }
 
+/// Parse a `i64` unix timestamp that can either be in seconds, milliseconds or
+/// nanoseconds.
+///
+/// This attempts to parse timestamps based on what cutoff range they fall into.
+/// For seconds to be parsed the timestamp must be less than the unix epoch of
+/// the year `2400`. For this to parse milliseconds the time must be smaller
+/// than the year `10,000` in unix epcoch milliseconds. If the value is larger
+/// than both we attempt to parse it as nanoseconds.
+///
+/// Returns `None` if `t` is negative.
+fn parse_timestamp(t: i64) -> Option<DateTime<Utc>> {
+    // Utc.ymd(2400, 1, 1).and_hms(0,0,0).timestamp();
+    const SEC_CUTOFF: i64 = 13569465600;
+    // Utc.ymd(10_000, 1, 1).and_hms(0,0,0).timestamp_millis();
+    const MILLISEC_CUTOFF: i64 = 253402300800000;
+
+    // Timestamps can't be negative!
+    if t < 0 {
+        return None;
+    }
+
+    let ts = if t < SEC_CUTOFF {
+        Utc.timestamp(t, 0)
+    } else if t < MILLISEC_CUTOFF {
+        Utc.timestamp_millis(t)
+    } else {
+        Utc.timestamp_nanos(t)
+    };
+
+    Some(ts)
+}
+
 /// Maintains last known extracted value of field and uses it in the absence of field.
 struct DefaultExtractor {
     field: &'static str,
     to_field: &'static Atom,
-    value: Option<ValueKind>,
+    value: Option<Value>,
 }
 
 impl DefaultExtractor {
@@ -444,7 +509,7 @@ impl DefaultExtractor {
     fn new_with(
         field: &'static str,
         to_field: &'static Atom,
-        value: impl Into<Option<ValueKind>>,
+        value: impl Into<Option<Value>>,
     ) -> Self {
         DefaultExtractor {
             field,
@@ -453,17 +518,26 @@ impl DefaultExtractor {
         }
     }
 
-    fn extract(&mut self, log: &mut LogEvent, value: &mut Value) {
+    fn extract(&mut self, log: &mut LogEvent, value: &mut JsonValue) {
         // Process json_field
-        if let Some(Value::String(new_value)) = value.get_mut(self.field).map(Value::take) {
+        if let Some(JsonValue::String(new_value)) = value.get_mut(self.field).map(JsonValue::take) {
             self.value = Some(new_value.into());
         }
 
         // Add data field
         if let Some(index) = self.value.as_ref() {
-            log.insert_explicit(self.to_field.clone(), index.clone());
+            log.insert(self.to_field.clone(), index.clone());
         }
     }
+}
+
+/// For tracking origin of the timestamp
+#[derive(Clone, Debug)]
+enum Time {
+    /// Backup
+    Now(DateTime<Utc>),
+    /// Provided in the request
+    Provided(DateTime<Utc>),
 }
 
 /// Creates event from raw request
@@ -474,7 +548,7 @@ fn raw_event(
     host: Option<String>,
 ) -> Result<Event, Rejection> {
     // Process gzip
-    let message: ValueKind = if gzip {
+    let message: Value = if gzip {
         let mut data = Vec::new();
         match GzDecoder::new(bytes.reader()).read_to_end(&mut data) {
             Ok(0) => return Err(ApiError::NoData.into()),
@@ -493,15 +567,23 @@ fn raw_event(
     let log = event.as_mut_log();
 
     // Add message
-    log.insert_explicit(event::MESSAGE.clone(), message);
+    log.insert(event::log_schema().message_key().clone(), message);
 
     // Add channel
-    log.insert_explicit(CHANNEL.clone(), channel.as_bytes().into());
+    log.insert(CHANNEL.clone(), channel.as_bytes());
 
     // Add host
     if let Some(host) = host {
-        log.insert_explicit(event::HOST.clone(), host.as_bytes().into());
+        log.insert(event::log_schema().host_key().clone(), host.as_bytes());
     }
+
+    // Add timestamp
+    log.insert(event::log_schema().timestamp_key().clone(), Utc::now());
+
+    // Add source type
+    event
+        .as_mut_log()
+        .try_insert(event::log_schema().source_type_key(), "splunk_hec");
 
     Ok(event)
 }
@@ -629,18 +711,24 @@ fn event_error(text: &str, code: u16, event: usize) -> Response<Body> {
     }
 }
 
+#[cfg(feature = "sinks-splunk_hec")]
 #[cfg(test)]
 mod tests {
-    use super::SplunkConfig;
+    use super::{parse_timestamp, SplunkConfig};
     use crate::runtime::{Runtime, TaskExecutor};
-    use crate::sinks::splunk_hec::{Encoding, HecSinkConfig};
-    use crate::sinks::{util::Compression, Healthcheck, RouterSink};
     use crate::test_util::{self, collect_n};
     use crate::{
         event::{self, Event},
+        shutdown::ShutdownSignal,
+        sinks::{
+            splunk_hec::{Encoding, HecSinkConfig},
+            util::{encoding::EncodingConfigWithDefault, Compression},
+            Healthcheck, RouterSink,
+        },
         topology::config::{GlobalOptions, SinkConfig, SinkContext, SourceConfig},
     };
-    use futures::{stream, sync::mpsc, Sink};
+    use chrono::{TimeZone, Utc};
+    use futures01::{stream, sync::mpsc, Sink};
     use http::Method;
     use std::net::SocketAddr;
 
@@ -650,15 +738,25 @@ mod tests {
     const CHANNEL_CAPACITY: usize = 1000;
 
     fn source(rt: &mut Runtime) -> (mpsc::Receiver<Event>, SocketAddr) {
+        source_with(rt, Some(TOKEN.to_owned()))
+    }
+
+    fn source_with(rt: &mut Runtime, token: Option<String>) -> (mpsc::Receiver<Event>, SocketAddr) {
         test_util::trace_init();
         let (sender, recv) = mpsc::channel(CHANNEL_CAPACITY);
         let address = test_util::next_addr();
         rt.spawn(
             SplunkConfig {
                 address,
-                token: TOKEN.to_owned(),
+                token,
+                tls: None,
             }
-            .build("default", &GlobalOptions::default(), sender)
+            .build(
+                "default",
+                &GlobalOptions::default(),
+                ShutdownSignal::noop(),
+                sender,
+            )
             .unwrap(),
         );
         (recv, address)
@@ -666,14 +764,14 @@ mod tests {
 
     fn sink(
         address: SocketAddr,
-        encoding: Encoding,
+        encoding: impl Into<EncodingConfigWithDefault<Encoding>>,
         compression: Compression,
         exec: TaskExecutor,
     ) -> (RouterSink, Healthcheck) {
         HecSinkConfig {
             host: format!("http://{}", address),
             token: TOKEN.to_owned(),
-            encoding,
+            encoding: encoding.into(),
             compression: Some(compression),
             ..HecSinkConfig::default()
         }
@@ -682,7 +780,7 @@ mod tests {
     }
 
     fn start(
-        encoding: Encoding,
+        encoding: impl Into<EncodingConfigWithDefault<Encoding>>,
         compression: Compression,
     ) -> (Runtime, RouterSink, mpsc::Receiver<Event>) {
         let mut rt = test_util::runtime();
@@ -741,7 +839,18 @@ mod tests {
 
         let event = channel_n(vec![message], sink, source, &mut rt).remove(0);
 
-        assert_eq!(event.as_log()[&event::MESSAGE], message.into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            message.into()
+        );
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().timestamp_key())
+            .is_some());
+        assert_eq!(
+            event.as_log()[event::log_schema().source_type_key()],
+            "splunk_hec".into()
+        );
     }
 
     #[test]
@@ -751,7 +860,18 @@ mod tests {
 
         let event = channel_n(vec![message], sink, source, &mut rt).remove(0);
 
-        assert_eq!(event.as_log()[&event::MESSAGE], message.into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            message.into()
+        );
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().timestamp_key())
+            .is_some());
+        assert_eq!(
+            event.as_log()[event::log_schema().source_type_key()],
+            "splunk_hec".into()
+        );
     }
 
     #[test]
@@ -766,7 +886,18 @@ mod tests {
         let events = channel_n(messages.clone(), sink, source, &mut rt);
 
         for (msg, event) in messages.into_iter().zip(events.into_iter()) {
-            assert_eq!(event.as_log()[&event::MESSAGE], msg.into());
+            assert_eq!(
+                event.as_log()[&event::log_schema().message_key()],
+                msg.into()
+            );
+            assert!(event
+                .as_log()
+                .get(&event::log_schema().timestamp_key())
+                .is_some());
+            assert_eq!(
+                event.as_log()[event::log_schema().source_type_key()],
+                "splunk_hec".into()
+            );
         }
     }
 
@@ -777,7 +908,18 @@ mod tests {
 
         let event = channel_n(vec![message], sink, source, &mut rt).remove(0);
 
-        assert_eq!(event.as_log()[&event::MESSAGE], message.into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            message.into()
+        );
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().timestamp_key())
+            .is_some());
+        assert_eq!(
+            event.as_log()[event::log_schema().source_type_key()],
+            "splunk_hec".into()
+        );
     }
 
     #[test]
@@ -792,7 +934,18 @@ mod tests {
         let events = channel_n(messages.clone(), sink, source, &mut rt);
 
         for (msg, event) in messages.into_iter().zip(events.into_iter()) {
-            assert_eq!(event.as_log()[&event::MESSAGE], msg.into());
+            assert_eq!(
+                event.as_log()[&event::log_schema().message_key()],
+                msg.into()
+            );
+            assert!(event
+                .as_log()
+                .get(&event::log_schema().timestamp_key())
+                .is_some());
+            assert_eq!(
+                event.as_log()[event::log_schema().source_type_key()],
+                "splunk_hec".into()
+            );
         }
     }
 
@@ -801,12 +954,8 @@ mod tests {
         let (mut rt, sink, source) = start(Encoding::Json, Compression::Gzip);
 
         let mut event = Event::new_empty_log();
-        event
-            .as_mut_log()
-            .insert_explicit("greeting".into(), "hello".into());
-        event
-            .as_mut_log()
-            .insert_explicit("name".into(), "bob".into());
+        event.as_mut_log().insert("greeting", "hello");
+        event.as_mut_log().insert("name", "bob");
 
         let pump = sink.send(event);
         let _ = rt.block_on(pump).unwrap();
@@ -814,6 +963,31 @@ mod tests {
 
         assert_eq!(event.as_log()[&"greeting".into()], "hello".into());
         assert_eq!(event.as_log()[&"name".into()], "bob".into());
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().timestamp_key())
+            .is_some());
+        assert_eq!(
+            event.as_log()[event::log_schema().source_type_key()],
+            "splunk_hec".into()
+        );
+    }
+
+    #[test]
+    fn line_to_message() {
+        let (mut rt, sink, source) = start(Encoding::Json, Compression::Gzip);
+
+        let mut event = Event::new_empty_log();
+        event.as_mut_log().insert("line", "hello");
+
+        let pump = sink.send(event);
+        let _ = rt.block_on(pump).unwrap();
+        let event = rt.block_on(collect_n(source, 1)).unwrap().remove(0);
+
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            "hello".into()
+        );
     }
 
     #[test]
@@ -825,8 +999,19 @@ mod tests {
         assert_eq!(200, post(address, "services/collector/raw", message));
 
         let event = rt.block_on(collect_n(source, 1)).unwrap().remove(0);
-        assert_eq!(event.as_log()[&event::MESSAGE], message.into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            message.into()
+        );
         assert_eq!(event.as_log()[&super::CHANNEL], "guid".into());
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().timestamp_key())
+            .is_some());
+        assert_eq!(
+            event.as_log()[event::log_schema().source_type_key()],
+            "splunk_hec".into()
+        );
     }
 
     #[test]
@@ -855,6 +1040,22 @@ mod tests {
     }
 
     #[test]
+    fn no_autorization() {
+        let message = "no_autorization";
+        let mut rt = test_util::runtime();
+        let (source, address) = source_with(&mut rt, None);
+        let (sink, health) = sink(address, Encoding::Text, Compression::Gzip, rt.executor());
+        assert!(rt.block_on(health).is_ok());
+
+        let event = channel_n(vec![message], sink, source, &mut rt).remove(0);
+
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            message.into()
+        );
+    }
+
+    #[test]
     fn partial() {
         let message = r#"{"event":"first"}{"event":"second""#;
         let mut rt = test_util::runtime();
@@ -863,7 +1064,18 @@ mod tests {
         assert_eq!(400, post(address, "services/collector/event", message));
 
         let event = rt.block_on(collect_n(source, 1)).unwrap().remove(0);
-        assert_eq!(event.as_log()[&event::MESSAGE], "first".into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            "first".into()
+        );
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().timestamp_key())
+            .is_some());
+        assert_eq!(
+            event.as_log()[event::log_schema().source_type_key()],
+            "splunk_hec".into()
+        );
     }
 
     #[test]
@@ -876,13 +1088,53 @@ mod tests {
 
         let events = rt.block_on(collect_n(source, 3)).unwrap();
 
-        assert_eq!(events[0].as_log()[&event::MESSAGE], "first".into());
+        assert_eq!(
+            events[0].as_log()[&event::log_schema().message_key()],
+            "first".into()
+        );
         assert_eq!(events[0].as_log()[&super::SOURCE], "main".into());
 
-        assert_eq!(events[1].as_log()[&event::MESSAGE], "second".into());
+        assert_eq!(
+            events[1].as_log()[&event::log_schema().message_key()],
+            "second".into()
+        );
         assert_eq!(events[1].as_log()[&super::SOURCE], "main".into());
 
-        assert_eq!(events[2].as_log()[&event::MESSAGE], "third".into());
+        assert_eq!(
+            events[2].as_log()[&event::log_schema().message_key()],
+            "third".into()
+        );
         assert_eq!(events[2].as_log()[&super::SOURCE], "secondary".into());
+    }
+
+    #[test]
+    fn parse_timestamps() {
+        let cases = vec![
+            Utc::now(),
+            Utc.ymd(1971, 11, 7).and_hms(1, 1, 1),
+            Utc.ymd(2011, 08, 5).and_hms(1, 1, 1),
+            Utc.ymd(2189, 11, 4).and_hms(2, 2, 2),
+        ];
+
+        for case in cases {
+            let sec = case.timestamp();
+            let millis = case.timestamp_millis();
+            let nano = case.timestamp_nanos();
+
+            assert_eq!(
+                parse_timestamp(sec as i64).unwrap().timestamp(),
+                case.timestamp()
+            );
+            assert_eq!(
+                parse_timestamp(millis as i64).unwrap().timestamp_millis(),
+                case.timestamp_millis()
+            );
+            assert_eq!(
+                parse_timestamp(nano as i64).unwrap().timestamp_nanos(),
+                case.timestamp_nanos()
+            );
+        }
+
+        assert!(parse_timestamp(-1).is_none());
     }
 }

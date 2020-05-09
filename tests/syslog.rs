@@ -1,10 +1,15 @@
+#![cfg(all(feature = "sources-syslog", feature = "sinks-socket"))]
+
 use approx::assert_relative_eq;
-use futures::{Future, Sink, Stream};
+#[cfg(unix)]
+use futures01::{Future, Sink, Stream};
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
-use sinks::tcp::{self, TcpSinkConfig};
+use sinks::socket::SocketSinkConfig;
+use sinks::util::{encoding::EncodingConfig, Encoding};
 use std::{collections::HashMap, thread, time::Duration};
-use tokio::codec::{FramedWrite, LinesCodec};
+#[cfg(unix)]
+use tokio01::codec::{FramedWrite, LinesCodec};
 #[cfg(unix)]
 use tokio_uds::UnixStream;
 use vector::test_util::{
@@ -29,6 +34,7 @@ fn test_tcp_syslog() {
         "in",
         SyslogConfig::new(Mode::Tcp {
             address: in_addr.into(),
+            tls: None,
         }),
     );
     config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
@@ -151,7 +157,7 @@ fn test_unix_stream_syslog() {
         .collect();
 
     let input_lines: Vec<String> = input_messages.iter().map(|msg| msg.to_string()).collect();
-    let input_stream = futures::stream::iter_ok::<_, ()>(input_lines.clone().into_iter());
+    let input_stream = futures01::stream::iter_ok::<_, ()>(input_lines.clone().into_iter());
 
     UnixStream::connect(&in_path)
         .map_err(|e| panic!("{:}", e))
@@ -164,7 +170,7 @@ fn test_unix_stream_syslog() {
                 .map(|(_source, sink)| sink)
                 .and_then(|sink| {
                     let socket = sink.into_inner().into_inner();
-                    tokio::io::shutdown(socket)
+                    tokio01::io::shutdown(socket)
                         .map(|_| ())
                         .map_err(|e| panic!("{:}", e))
                 })
@@ -194,6 +200,7 @@ struct SyslogMessageRFC5424 {
     version: u8,
     timestamp: String,
     host: String,
+    source_type: String,
     appname: String,
     procid: usize,
     message: String,
@@ -222,6 +229,7 @@ impl SyslogMessageRFC5424 {
             version: 1,
             timestamp,
             host: "hogwarts".to_owned(),
+            source_type: "syslog".to_owned(),
             appname: "harry".to_owned(),
             procid: thread_rng().gen_range(0, 32768),
             structured_data,
@@ -321,10 +329,6 @@ fn encode_priority(severity: Severity, facility: Facility) -> u8 {
     facility as u8 | severity as u8
 }
 
-fn tcp_json_sink(address: String) -> TcpSinkConfig {
-    TcpSinkConfig {
-        address,
-        encoding: tcp::Encoding::Json,
-        tls: None,
-    }
+fn tcp_json_sink(address: String) -> SocketSinkConfig {
+    SocketSinkConfig::make_tcp_config(address, EncodingConfig::from(Encoding::Json), None)
 }
